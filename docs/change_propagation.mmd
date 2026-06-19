@@ -1,0 +1,9 @@
+flowchart TD
+    F["Raw file change<br/>or bronze code"] --> B["NB01 bronze<br/>contract_inventory<br/>(content_hash + code_hash)"]
+    B -->|new content_hash| S
+    SC["Silver/DI code change"] --> S["NB02 silver<br/>contract_text / _blocks / _tables<br/>(silver version_id)"]
+    S -->|silver version_id| C["NB03 chunk<br/>contract_chunks"]
+    CC["Chunk code / size / overlap change"] --> C
+    C --> IDX["NB03 search_index<br/>Azure AI Search"]
+    S -->|silver version_id| G["NB04 gold<br/>contract_fields"]
+    GC["Gold prompt / fields / model change"] --> G

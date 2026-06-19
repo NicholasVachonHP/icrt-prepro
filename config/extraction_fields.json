@@ -1,0 +1,82 @@
+[
+  {
+    "field_name": "parties",
+    "question": "List the full legal names of all contracting parties (e.g. customer and supplier). Return as a list of strings.",
+    "type": "list"
+  },
+  {
+    "field_name": "effective_date",
+    "question": "What is the contract effective/commencement date? Return ISO 8601 (YYYY-MM-DD) or null if not stated.",
+    "type": "string"
+  },
+  {
+    "field_name": "term_length",
+    "question": "What is the initial term length of the contract (e.g. '24 months', '3 years')? Return null if not stated.",
+    "type": "string"
+  },
+  {
+    "field_name": "auto_renewal",
+    "question": "Does the contract automatically renew? Return true, false, or null if not stated.",
+    "type": "boolean"
+  },
+  {
+    "field_name": "notice_period",
+    "question": "What notice period is required to terminate or prevent renewal (e.g. '90 days')? Return null if not stated.",
+    "type": "string"
+  },
+  {
+    "field_name": "contract_value",
+    "question": "What is the total or annual contract value, including currency (e.g. 'GBP 250,000 per annum')? Return null if not stated.",
+    "type": "string"
+  },
+  {
+    "field_name": "payment_terms",
+    "question": "What are the payment terms, in number of days (eg: 30)? Return null if not stated.",
+    "type": "integer"
+  },
+  {
+    "field_name": "governing_law",
+    "question": "Which jurisdiction's law governs the contract (e.g. 'England and Wales')? Return null if not stated.",
+    "type": "string"
+  },
+  {
+    "field_name": "data_residency_uk",
+    "question": "Does the contract require that data is stored and/or processed within the United Kingdom? Return true, false, or null if not stated.",
+    "type": "boolean"
+  },
+  {
+    "field_name": "liability_cap",
+    "question": "What is the limitation of liability / liability cap (e.g. 'fees paid in prior 12 months', 'GBP 1,000,000')? Return null if not stated.",
+    "type": "string"
+  },
+  {
+    "field_name": "confidentiality_clause",
+    "question": "Does the contract contain a confidentiality / non-disclosure obligation? Return true, false, or null if not stated.",
+    "type": "boolean"
+  },
+  {
+    "field_name": "services_offered",
+    "question": "List the services the supplier provides to the client under this contract (e.g. 'Occupational Health Services', 'Health Surveillance'). Return as a list of short service names. Return an empty list if not stated.",
+    "type": "list"
+  },
+  {
+    "field_name": "service_level_agreements",
+    "question": "List the service level agreements (SLAs) in the contract. For each SLA, give the service it applies to, a short description of the obligation, and the required timescale or target (e.g. response/resolution time, completion window). Return a JSON list of objects with keys 'service', 'description', 'timescale'. Return an empty list if no SLAs are stated.",
+    "type": "struct_list",
+    "item_fields": [
+      { "name": "service", "type": "string" },
+      { "name": "description", "type": "string" },
+      { "name": "timescale", "type": "string" }
+    ]
+  },
+  {
+    "field_name": "notable_clauses",
+    "question": "Identify any non-standard or notable clauses that stand out from standard terms because they shift risk, pricing, exclusivity, governance or compliance obligations. For each, give a short summary of the clause, its category (one of: risk, pricing, exclusivity, governance, compliance, other), and a brief rationale for why it is notable. Return a JSON list of objects with keys 'clause', 'category', 'rationale'. Return an empty list if none stand out.",
+    "type": "struct_list",
+    "item_fields": [
+      { "name": "clause", "type": "string" },
+      { "name": "category", "type": "string" },
+      { "name": "rationale", "type": "string" }
+    ]
+  }
+]

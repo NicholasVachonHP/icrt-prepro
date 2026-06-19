@@ -1,0 +1,74 @@
+{
+  "env": "prod",
+  "lakehouse": {
+    "shared": "ictr_lh_shared",
+    "bronze": "ictr_lh_bronze_prod",
+    "silver": "ictr_lh_silver_prod",
+    "gold": "ictr_lh_gold_prod"
+  },
+  "bronze": {
+    "files_dir": "/lakehouse/default/Files",
+    "table": "contract_inventory",
+    "active_view": "contract_inventory_active"
+  },
+  "silver": {
+    "bronze_table": "dbo/contract_inventory",
+    "table": "contract_text",
+    "active_view": "contract_text_active",
+    "blocks_table": "contract_blocks",
+    "blocks_active_view": "contract_blocks_active",
+    "tables_table": "contract_tables",
+    "tables_active_view": "contract_tables_active",
+    "chunks_table": "contract_chunks",
+    "chunks_active_view": "contract_chunks_active",
+    "document_intelligence": {
+      "_note": "Azure Document Intelligence prebuilt-layout extraction. Endpoint/key are read at runtime from env vars AZURE_DOC_INTELLIGENCE_ENDPOINT / AZURE_DOC_INTELLIGENCE_KEY (add them to the Fabric environment .env resource). When caption_figures is true, cropped figure images are downloaded from DI, saved under Files/<figures_subdir>, and (if a multimodal vision_model and the openai endpoint are available) used to enrich figure captions. min_figure_page_fraction drops decorative figures (logos, header/footer glyphs) whose bounding box is below that share of the page, before captioning/saving/chunking; 0 keeps every figure.",
+      "model_id": "prebuilt-layout",
+      "caption_figures": true,
+      "max_caption_chars": 2000,
+      "vision_model": "gpt-4.1",
+      "save_figure_images": true,
+      "figures_subdir": "contract_figures",
+      "figures_root": "/lakehouse/default/Files",
+      "min_figure_page_fraction": 0.02
+    }
+  },
+  "serving": {
+    "chunks_source_table": "contract_chunks",
+    "upload_batch_size": 100
+  },
+  "gold": {
+    "silver_text_table": "dbo/contract_text",
+    "fields_table": "contract_fields",
+    "fields_active_view": "contract_fields_active",
+    "fields_config": "config/extraction_fields.json"
+  },
+  "eval": {
+    "_note": "Standalone gold quality gate (contract_intelligence.eval.gold_eval). Scores contract_fields against a hand-authored ground truth derived from docs/Contract_Review.docx. Run on demand after prompt/field/model changes \u2014 not part of the daily pipeline. truth is keyed by join_key; results append to results_table in the gold lakehouse.",
+    "truth_config": "config/eval/contract_truth.json",
+    "results_table": "gold_eval_results",
+    "join_key": "file_name"
+  },
+  "sharepoint": {
+    "site_url": "https://yourorg.sharepoint.com/sites/contracts",
+    "library": "Contracts"
+  },
+  "azure_openai": {
+    "_note": "Auth is API-key via the openai.OpenAI client against AZURE_OPENAI_ENDPOINT (.../openai/v1) with AZURE_AI_PROJECT_API_KEY. Model deployment names come from MAIN_MODEL/EMBEDDING_MODEL env vars; kept here for reference.",
+    "embedding_model": "text-embedding-3-large",
+    "completion_model": "gpt-4.1"
+  },
+  "ai_search": {
+    "_note": "Endpoint/key read at runtime from env (AZURE_SEARCH_ENDPOINT / AZURE_SEARCH_API_KEY). Single index of clause evidence (one doc per silver chunk) consumed by the Foundry RAG agent. The index name is overridable by env AZURE_SEARCH_INDEX_NAME. The vectorizer uses the embedding deployment (EMBEDDING_MODEL) against AZURE_OPENAI_ENDPOINT for query-time integrated vectorization. Requires azure-search-documents>=11.5.1.",
+    "index_name": "ictr_prod_di_vision",
+    "vector_profile_name": "embedding-profile",
+    "vectorizer_name": "aoai-embedding-vectorizer",
+    "semantic_config_name": "ictr-semantic",
+    "embedding_deployment": "text-embedding-3-large"
+  },
+  "chunking": {
+    "chunk_size": 512,
+    "chunk_overlap": 64,
+    "embedding_dimensions": 3072
+  }
+}

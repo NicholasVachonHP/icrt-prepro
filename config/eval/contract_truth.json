@@ -1,0 +1,66 @@
+[
+  {
+    "file_name": "Royalmail_Contract.pdf",
+    "client": "Royal Mail",
+    "source": "docs/Contract_Review.docx (Health Partners — Client Contract Portfolio, 29 May 2026); contract-specific Q&A set (analysis-65, image-55).",
+    "fields": {
+      "effective_date": "2023-10-02",
+      "payment_terms": 60,
+      "services_offered": [
+        "Management referrals",
+        "Pre-placement health screening",
+        "Health surveillance",
+        "OH advice line"
+      ],
+      "service_level_agreements": "Health Partners standard occupational-health service levels apply: advice line Mon–Fri 09:00–17:30; questionnaire to certificate 1 working day; OHA referral to advice letter average 5 working days; specialist/physio/mental-health average 8 working days; complaints acknowledged within 48 hours and full response within 20 working days. In addition, a Royal Mail experience survey is circulated to the referring manager within 2 days of a case. Service credits are calculated per failing case as a percentage of the unit cost (e.g. 2% × number of cases × £46 for Average Clearance Time of 6–12 days against a 6-day SLA target).",
+      "notable_clauses": "Schedule 6 imposes Anti-Bribery & Corruption, Sanctions, Supply-Chain Transparency and Anti-Facilitation of Tax Evasion obligations. The Master Purchase Agreement carries no minimum spend commitment — Royal Mail may decrease demand to zero, subject only to an Annual Account Management Charge and clause 5.9 cancellation fees — and includes an option to extend the term by up to 2 years."
+    }
+  },
+  {
+    "file_name": "Tesco_Contract.pdf",
+    "client": "Tesco",
+    "source": "docs/Contract_Review.docx (Health Partners — Client Contract Portfolio, 29 May 2026); contract-specific Q&A set (tesco-simple-16/19, tesco-table-36, simple-20, analysis-63/65/67).",
+    "fields": {
+      "effective_date": "2022-10-27",
+      "term_length": "36 months",
+      "data_residency_uk": true,
+      "services_offered": [
+        "Management referrals",
+        "Pre-placement health screening",
+        "Health surveillance",
+        "OH advice line"
+      ],
+      "service_level_agreements": "Service-credit-backed SLAs: a 5% service credit applies where performance on any SLA line falls below 90% for 3 consecutive months; service credits are capped at 3 service lines per period and at 20% of total monthly fees in any period, with a monthly MI pack and spend report. Underlying Health Partners standard occupational-health service levels also apply.",
+      "notable_clauses": "Benchmarking obligation; service credits capped at 3 service lines per period (max 20% of monthly fees); affiliate/sub-contractor notification regime; Appendix E (controller-to-controller) clause (o) bars transfer of Contracted Personal Data outside the UK without prior written consent."
+    }
+  },
+  {
+    "file_name": "Boots_Variartion.pdf",
+    "client": "Boots",
+    "source": "docs/Contract_Review.docx (Health Partners — Client Contract Portfolio, 29 May 2026); contract-specific Q&A set (boots-simple-01/03/05, analysis-64).",
+    "fields": {
+      "effective_date": "2025-09-01",
+      "contract_value": "GBP 478,687.30 per annum",
+      "payment_terms": 75,
+      "notable_clauses": "This is a 3-year extension Variation that replaces Schedule 7 (Charges & Payment) with Appendix A, using a fixed annual fee of £478,687.30 (paid 1/12th monthly in arrears) with a 5% volume tolerance (10% for physiotherapy). It carries PCI / cardholder-data security obligations, and Confidential Information must remain at the disclosed data centre(s) and not be moved to any other hosting."
+    }
+  },
+  {
+    "file_name": "Lloyds_Contract.pdf",
+    "client": "Lloyds (LBG)",
+    "source": "docs/Contract_Review.docx (Health Partners — Client Contract Portfolio, 29 May 2026)",
+    "fields": {
+      "services_offered": [
+        "Workplace and DSE assessments",
+        "Complex assessments",
+        "Disability and neurodivergent software",
+        "Office equipment",
+        "Employee coaching",
+        "BSL interpretation",
+        "Accessible-technology scripting",
+        "Cancer-at-work support"
+      ],
+      "notable_clauses": "Amendment Agreement covering a subcontractor / data schedule; workplace adjustments are delivered via approved subcontractors."
+    }
+  }
+]
