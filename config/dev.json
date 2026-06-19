@@ -13,6 +13,8 @@
     "active_view": "contract_inventory_active"
   },
   "silver": {
+    "_max_concurrency_note": "Threads running Document Intelligence concurrently (silver.max_concurrency). DI Standard (S0) allows 15 analyze transactions/sec by default (raisable via a support ticket); 10 leaves headroom and also bounds the gpt-4.1 figure-captioning calls made inside extraction. Raise toward 15 only if DI is the bottleneck and no 429s appear. Source: Azure Document Intelligence service-limits (S0 = 15 TPS analyze).",
+    "max_concurrency": 10,
     "bronze_table": "dbo/contract_inventory",
     "table": "contract_text",
     "active_view": "contract_text_active",
@@ -39,6 +41,8 @@
     "upload_batch_size": 100
   },
   "gold": {
+    "_max_concurrency_note": "Threads running gpt-4.1 field extraction concurrently (gold.max_concurrency). TOKEN-bound, not request-bound: each call sends a full contract, so tokens-per-minute (TPM) is the ceiling. Deployment gpt-4.1 (fp-sprag-dev-uks-01-resource, UK South, Global Standard) is allocated 750K TPM. 8 keeps momentary in-flight tokens well under 750K even for large contracts, with headroom for retries; the SDK retries 429s automatically. Raise further only if you see consistently low TPM utilisation and no 429s.",
+    "max_concurrency": 8,
     "silver_text_table": "dbo/contract_text",
     "fields_table": "contract_fields",
     "fields_active_view": "contract_fields_active",

@@ -33,6 +33,7 @@ and the *bronze* lakehouse is mounted read-only.
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from delta.tables import DeltaTable
@@ -175,6 +176,14 @@ def run(spark, notebookutils, config=None, bronze_tables_path=None, bronze_files
     tables_table = silver_cfg.get("tables_table", TABLES_TABLE)
     bronze_table = silver_cfg.get("bronze_table", "contract_inventory")
 
+    # Number of contracts whose Document Intelligence analysis runs concurrently.
+    # DI (plus optional figure captioning) is one I/O-bound analyze call per
+    # contract, so a bounded thread pool turns the serial driver loop into
+    # parallel calls. Cap this at or below the DI / vision deployment's
+    # requests-per-minute headroom. Not part of the code fingerprint, so tuning
+    # it never forces reprocessing.
+    max_concurrency = max(1, int(silver_cfg.get("max_concurrency", 8)))
+
     model_id = di_cfg.get("model_id", "prebuilt-layout")
     max_caption_chars = int(di_cfg.get("max_caption_chars", 2000))
     caption_figures = bool(di_cfg.get("caption_figures", True))
@@ -281,12 +290,18 @@ def run(spark, notebookutils, config=None, bronze_tables_path=None, bronze_files
         table_rows = []
         errors = {}
 
-        for row in pending:
+        def _extract_row(row):
+            """Run Document Intelligence for one contract (thread worker).
+
+            Captures its own exceptions and returns ``(row, vid, doc, error)`` so
+            no call escapes the pool. Only this slow analyze call runs in
+            parallel; row assembly, figure persistence and the Delta writes below
+            stay on the driver thread.
+            """
             rel = row["relative_path"]
             file_path = f"{bronze_files_dir}/{rel}"
             vid = version_id(rel, row["content_hash"], current_code)
             figure_prefix = f"{figures_subdir}/{_safe_key(rel, 'fig', vid)}"
-
             try:
                 doc = di_extract.extract_document(
                     file_path,
@@ -299,10 +314,22 @@ def run(spark, notebookutils, config=None, bronze_tables_path=None, bronze_files
                     vision_client=vision_client,
                     vision_model=vision_model,
                 )
-                error = None
+                return row, vid, doc, None
             except Exception as e:  # noqa: BLE001 - record and keep going
-                doc = None
-                error = str(e)
+                return row, vid, None, str(e)
+
+        # Fan the per-contract Document Intelligence calls out across a bounded
+        # thread pool instead of running them one-at-a-time on the driver. The
+        # DI / vision clients are safe to share across threads and
+        # ``executor.map`` preserves order, so the SCD2 rows are assembled
+        # deterministically below.
+        workers = min(max_concurrency, len(pending))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            extractions = list(pool.map(_extract_row, pending))
+
+        for row, vid, doc, error in extractions:
+            rel = row["relative_path"]
+            if error:
                 errors[rel] = error
 
             text_rows.append(
