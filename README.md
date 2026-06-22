@@ -26,6 +26,7 @@ full **Slowly Changing Dimension Type 2 (SCD2)** version history at every layer.
 - [9. Running the Pipeline](#9-running-the-pipeline)
 - [10. Rebuilding Tables After a Schema Change](#10-rebuilding-tables-after-a-schema-change)
 - [11. Source Modules](#11-source-modules)
+- [12. Local Git Mirror (`sync.ps1`)](#12-local-git-mirror-syncps1)
 
 ---
 
@@ -253,3 +254,41 @@ keys don't orphan.
 For the full design rationale, see
 [docs/ADR_ContractIntelligence_2026-06-08.md](docs/ADR_ContractIntelligence_2026-06-08.md)
 and the architecture diagram [docs/ICTR_Architecture.mmd](docs/ICTR_Architecture.mmd).
+
+---
+
+## 12. Local Git Mirror (`sync.ps1`)
+
+> This section applies **only when working in the local Git clone of this repo**,
+> not in the Fabric lakehouse. `sync.ps1` exists only on your machine — it is
+> git-ignored and excluded from the mirror, so it has no effect anywhere else.
+
+`sync.ps1` keeps a **local Git copy** of this lakehouse's `Files/` in step with
+OneLake so the code and config can be version-tracked. Run it from the root of
+the local repo:
+
+```powershell
+.\sync.ps1
+```
+
+When run in the local repo it performs **four steps**:
+
+1. **Refresh prompt** — reminds you to right-click the OneLake folder in Windows
+   File Explorer, choose **"Sync from OneLake"**, and wait for it to finish, then
+   asks `y/n` before continuing. (There is no CLI to force that cloud refresh, so
+   this manual step ensures the local OneLake cache holds the latest cloud changes.)
+2. **Hydration** — downloads any cloud-only placeholder files and waits until
+   they are all present locally (`-TimeoutMinutes`, default 10).
+3. **Mirror** — `robocopy /MIR` copies the OneLake `Files/` into the repo,
+   excluding `sync.ps1`, `.gitignore`, `.git/`, `__pycache__/`, `*.pyc`, and `*.pyo`.
+4. **Handoff** — staging, commit, and push are left to you.
+
+After it finishes, review and commit the changes:
+
+```powershell
+git status
+git add .
+git commit -m "Sync from OneLake"
+git push
+```
+
