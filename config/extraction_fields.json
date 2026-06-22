@@ -2,7 +2,8 @@
   {
     "field_name": "parties",
     "question": "List the full legal names of all contracting parties (e.g. customer and supplier). Return as a list of strings.",
-    "type": "list"
+    "type": "list",
+    "reduce": "llm"
   },
   {
     "field_name": "effective_date",
@@ -27,7 +28,8 @@
   {
     "field_name": "contract_value",
     "question": "What is the total or annual contract value, including currency (e.g. 'GBP 250,000 per annum')? Return null if not stated.",
-    "type": "string"
+    "type": "string",
+    "source": "tables"
   },
   {
     "field_name": "payment_terms",
@@ -63,6 +65,7 @@
     "field_name": "service_level_agreements",
     "question": "List the service level agreements (SLAs) in the contract. For each SLA, give the service it applies to, a short description of the obligation, and the required timescale or target (e.g. response/resolution time, completion window). Return a JSON list of objects with keys 'service', 'description', 'timescale'. Return an empty list if no SLAs are stated.",
     "type": "struct_list",
+    "source": "tables",
     "item_fields": [
       { "name": "service", "type": "string" },
       { "name": "description", "type": "string" },

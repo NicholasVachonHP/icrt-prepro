@@ -53,7 +53,16 @@
     "judge_enabled": true,
     "judge_model": null,
     "fuzzy_threshold": 0.85,
-    "evidence_max_chars": 600
+    "evidence_max_chars": 600,
+    "_structured_output_note": "Fields are grouped by extraction strategy (one focused model call per group). Each call uses a strict per-type json_schema response_format so values come back correctly typed (boolean/integer/array/struct). Falls back to a plain json_object call if the deployment rejects json_schema. Feeds the gold code_hash, so toggling it re-extracts all contracts.",
+    "structured_output": true,
+    "_type_validation_note": "Per-type structural validation (gold/validate.py): each extracted value is checked against its declared type/format (boolean is a bool, integer an int, list parses non-empty, struct_list items carry their keys). The result (valid/invalid/not_applicable) is stored on contract_field_evidence and acts as a hard gate in trust derivation \u2014 a structurally invalid value can never be 'high'. Feeds the gold code_hash, so toggling it re-extracts all contracts.",
+    "type_validation_enabled": true,
+    "_retrieval_note": "Per-strategy retrieval (gold/retrieval.py). RAG / retrieve-classify field groups pull the retrieval_top_k most relevant chunks per field question from the existing AI Search index (server-side vectorizer, same embedding model as ingest), filtered to the one contract; a group returning fewer than retrieval_min_chunks hits falls back to full text so recall never regresses. AI Search endpoint/key are read from env (AZURE_SEARCH_ENDPOINT / AZURE_SEARCH_API_KEY); absent => full-text fallback. retrieval_top_k and retrieval_min_chunks feed the gold code_hash (changing them re-extracts all contracts).",
+    "retrieval_top_k": 6,
+    "retrieval_min_chunks": 3,
+    "_token_budget_note": "Caps the summed in-flight token cost across the global gold work queue (gold/scheduler.py), which fans every model call from every contract (extraction -> reduce -> judge) into one pool throttled by tokens, not a fixed thread count. Set below the gpt-4.1 deployment's per-minute token ceiling (750K TPM); 500K leaves headroom for SDK 429 retries. Pure runtime knob \u2014 NOT part of the code fingerprint, so tuning it never forces reprocessing. Replaces the now-ignored max_concurrency.",
+    "token_budget": 500000
   },
   "eval": {
     "_note": "Standalone gold quality gate (contract_intelligence.eval.gold_eval). Scores contract_fields against a hand-authored ground truth derived from docs/Contract_Review.docx. Run on demand after prompt/field/model changes \u2014 not part of the daily pipeline. truth is keyed by join_key; results append to results_table in the gold lakehouse.",
