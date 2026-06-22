@@ -18,11 +18,21 @@ the field / question definitions, the model name and the input cap -- so editing
 the prompt or the field config re-runs extraction over existing, unchanged
 contracts. Contracts tombstoned in silver are tombstoned here too.
 
+Alongside the wide value table, each field's **provenance** is written to the
+tall ``contract_field_evidence`` table (one row per contract version *per
+field*): the verbatim ``evidence`` quote the model cited, a mechanical
+``match_type`` saying whether that quote is actually in the contract text, an
+LLM ``judge_verdict`` saying whether the value+evidence correctly answer the
+field's question, and a fused categorical ``trust`` (high / review / low /
+unknown). See :mod:`contract_intelligence.gold.evidence`. The judge prompt and
+fuzzy threshold also feed the ``code_hash``.
+
 Designed to run inside a Microsoft Fabric notebook attached to the *gold*
 lakehouse, with the silver lakehouse mounted read-only and the *ictr_dev*
 environment attached (provides ``openai`` / ``azure-ai-projects`` and secrets).
 """
 
+import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -42,9 +52,15 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+from . import evidence as ev
 from ..common.ai_clients import get_openai_client
 from ..common.versioning import code_fingerprint
-from ..common.scd2 import scd2_merge, resolve_force_paths, apply_force
+from ..common.scd2 import (
+    scd2_merge,
+    scd2_expire_and_append,
+    resolve_force_paths,
+    apply_force,
+)
 
 # Default cap on contract characters sent to the model. Sized to gpt-4.1's
 # ~1,047,576-token context window: reserving the 32,768-token max output plus a
@@ -72,11 +88,43 @@ _META_FIELDS = [
     StructField("doc_deleted", BooleanType(), False),
 ]
 
+# Tall companion-table columns. One row per (contract version, field): the
+# extracted value, the verbatim evidence quote, whether that quote is real
+# (``match_type``), whether it correctly answers the question (``judge_verdict``)
+# and the fused categorical ``trust``. SCD2 like the wide table.
+_EVIDENCE_META = [
+    StructField("evidence_id", StringType(), False),     # sha(version_id|field)
+    StructField("version_id", StringType(), False),      # = wide row's version_id
+    StructField("relative_path", StringType(), False),
+    StructField("file_name", StringType(), False),
+    StructField("field_name", StringType(), False),
+    StructField("value", StringType(), True),            # stringified wide value
+    StructField("evidence_text", StringType(), True),    # verbatim quote
+    StructField("match_type", StringType(), False),      # is the quote real?
+    StructField("judge_verdict", StringType(), True),    # answers the question?
+    StructField("judge_rationale", StringType(), True),
+    StructField("judge_error", StringType(), True),      # non-fatal judge failure
+    StructField("trust", StringType(), False),           # high/review/low/unknown
+    StructField("contract_truncated", BooleanType(), False),
+    StructField("model", StringType(), True),
+    StructField("judge_model", StringType(), True),
+    StructField("valid_from", TimestampType(), False),
+    StructField("valid_to", TimestampType(), True),
+    StructField("is_current", BooleanType(), False),
+    StructField("doc_deleted", BooleanType(), False),
+]
+
+_EVIDENCE_SCHEMA = StructType(_EVIDENCE_META)
+
 _SYSTEM_PROMPT = (
     "You are a meticulous contracts analyst. You extract structured facts from a "
     "single contract. Only use information present in the contract text. If a value "
-    "is not stated, return null — never guess. Respond with a single JSON object "
-    "whose keys are exactly the requested field names."
+    "is not stated, return null — never guess. For every field return a JSON "
+    "object with two keys: \"value\" (the answer, in the requested shape, or null) "
+    "and \"evidence\" (a short verbatim quote copied EXACTLY from the contract "
+    "text that supports the value, or null when the value is null). Never "
+    "paraphrase the evidence. Respond with a single JSON object whose keys are "
+    "exactly the requested field names."
 )
 
 
@@ -222,7 +270,9 @@ def _build_prompt(fields, text, max_chars):
     )
     return (
         "Extract the following fields from the contract. Return a JSON object with "
-        "exactly these keys:\n"
+        "exactly these keys; each maps to "
+        '{"value": <answer or null>, "evidence": <verbatim supporting quote or '
+        'null>}:\n'
         f"{questions}\n\n"
         "Contract text:\n"
         '"""\n'
@@ -231,8 +281,30 @@ def _build_prompt(fields, text, max_chars):
     )
 
 
+def _stringify_value(v):
+    """Render a (possibly already-coerced) wide value as a string for the tall
+    ``value`` column and the judge prompt. ``None`` stays ``None``."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    return json.dumps(v, ensure_ascii=False)
+
+
+def _evidence_id(version_id, field_name):
+    """Stable unique key for a (contract version, field) evidence row."""
+    return hashlib.sha256(f"{version_id}|{field_name}".encode()).hexdigest()[:16]
+
+
 def _extract_one(client, model, fields, text, max_chars):
-    """Call the model for one contract; return (values_dict, error_or_None)."""
+    """Call the model for one contract.
+
+    Returns ``(values_dict, evidence_dict, error_or_None)`` where ``values_dict``
+    holds the type-coerced wide value per field and ``evidence_dict`` the verbatim
+    supporting quote (string or ``None``) per field. The model now returns
+    ``{"value": ..., "evidence": ...}`` per field; a bare scalar (no object) is
+    tolerated as a value with no evidence.
+    """
     prompt = _build_prompt(fields, text, max_chars)
     try:
         resp = client.chat.completions.create(
@@ -246,14 +318,100 @@ def _extract_one(client, model, fields, text, max_chars):
         )
         data = json.loads(resp.choices[0].message.content)
     except Exception as e:  # noqa: BLE001 - record and continue with next contract
-        return {}, str(e)
+        return {}, {}, str(e)
 
-    # Coerce each field to the declared type so it matches the Delta column.
-    values = {}
+    # Coerce each field to the declared type so it matches the Delta column, and
+    # pull out the verbatim evidence quote.
+    values, evidence = {}, {}
     for f in fields:
         name = f["field_name"]
-        values[name] = _coerce(data.get(name), f)
-    return values, None
+        item = data.get(name)
+        if isinstance(item, dict) and ("value" in item or "evidence" in item):
+            raw_value = item.get("value")
+            quote = item.get("evidence")
+        else:
+            raw_value = item          # bare scalar (no object) fallback
+            quote = None
+        values[name] = _coerce(raw_value, f)
+        evidence[name] = quote if isinstance(quote, str) and quote else None
+    return values, evidence, None
+
+
+def _process_one(
+    client, model, judge_model, fields, text, max_chars,
+    fuzzy_threshold, evidence_max_chars, judge_enabled,
+):
+    """Extract, locate evidence, and judge one contract.
+
+    Returns ``(values, error, truncated, field_rows)``. ``field_rows`` is a list
+    of per-field dicts (everything for the tall table except the identity /
+    SCD2 columns the caller stamps on). On extraction error no field rows are
+    produced (the contract auto-retries next run, like the wide table).
+    """
+    values, evidence, error = _extract_one(client, model, fields, text, max_chars)
+    if error:
+        return values, error, False, []
+
+    truncated = len(text) > max_chars
+
+    # Step 2: classify each quote against the *full* contract text.
+    located = {}  # field_name -> (value_str, quote, match_type)
+    for f in fields:
+        name = f["field_name"]
+        value_str = _stringify_value(values.get(name))
+        quote = evidence.get(name)
+        if value_str is None:
+            match_type = ev.MATCH_NA_NULL
+        elif not quote:
+            match_type = ev.MATCH_NOT_FOUND
+        else:
+            match_type = ev.locate_evidence(quote, text, fuzzy_threshold)
+        located[name] = (value_str, quote, match_type)
+
+    # Step 3: one judge call per contract (faithfulness + relevance).
+    verdicts, judge_error = {}, None
+    if judge_enabled:
+        try:
+            verdicts = ev.judge_fields(
+                client,
+                judge_model,
+                fields,
+                {
+                    n: {"value": located[n][0], "evidence": located[n][1]}
+                    for n in (f["field_name"] for f in fields)
+                },
+                text,
+                max_chars,
+            )
+        except Exception as e:  # noqa: BLE001 - non-fatal; fall back to locate-only
+            judge_error = str(e)
+
+    field_rows = []
+    for f in fields:
+        name = f["field_name"]
+        value_str, quote, match_type = located[name]
+        verdict_obj = verdicts.get(name, {})
+        verdict = verdict_obj.get("verdict")
+        rationale = verdict_obj.get("rationale")
+        trust = ev.derive_trust(
+            value_str, match_type, verdict, judge_error, judge_enabled
+        )
+        if quote and evidence_max_chars and len(quote) > evidence_max_chars:
+            quote = quote[:evidence_max_chars]
+        field_rows.append(
+            {
+                "field_name": name,
+                "value": value_str,
+                "evidence_text": quote,
+                "match_type": match_type,
+                "judge_verdict": verdict,
+                "judge_rationale": rationale,
+                "judge_error": judge_error,
+                "trust": trust,
+                "contract_truncated": truncated,
+            }
+        )
+    return values, None, truncated, field_rows
 
 
 def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=None):
@@ -280,8 +438,17 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
 
     fields_table = gold_cfg.get("fields_table", "contract_fields")
     fields_view = gold_cfg.get("fields_active_view", "contract_fields_active")
+    evidence_table = gold_cfg.get("fields_evidence_table", "contract_field_evidence")
+    evidence_view = gold_cfg.get(
+        "fields_evidence_active_view", "contract_field_evidence_active"
+    )
     silver_text_table = gold_cfg.get("silver_text_table", "dbo/contract_text")
     max_chars = int(gold_cfg.get("max_input_chars", _DEFAULT_MAX_INPUT_CHARS))
+    # Evidence + trust knobs. judge_enabled=False degrades cleanly to extract +
+    # locate only (trust derived from match_type alone, never ``high``).
+    judge_enabled = bool(gold_cfg.get("judge_enabled", True))
+    fuzzy_threshold = float(gold_cfg.get("fuzzy_threshold", 0.85))
+    evidence_max_chars = int(gold_cfg.get("evidence_max_chars", 600))
     # Number of contracts whose field extraction runs concurrently. Field
     # extraction is one chat completion per contract (I/O-bound), so a bounded
     # thread pool turns a serial driver loop into parallel calls. Cap this at or
@@ -291,17 +458,28 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
     model = os.environ.get("MAIN_MODEL") or cfg.get("azure_openai", {}).get(
         "completion_model", "gpt-4.1"
     )
+    # Judge model defaults to the main model unless overridden.
+    judge_model = (
+        gold_cfg.get("judge_model")
+        or os.environ.get("MAIN_MODEL")
+        or cfg.get("azure_openai", {}).get("completion_model", "gpt-4.1")
+    )
 
     fields = _load_fields(notebookutils, gold_cfg)
     schema = _build_schema(fields)
     silver_text_path = f"{silver_tables_path}/{silver_text_table}"
 
-    # Reprocessing fingerprint: changes with this module's code, the system
-    # prompt, the field/question definitions, the model, or the input cap.
+    # Reprocessing fingerprint: changes with this module's code, the evidence
+    # module's code, the system / judge prompts, the field/question definitions,
+    # the model, the input cap, or the evidence/judge knobs.
     current_code = code_fingerprint(
-        [__file__],
+        [__file__, ev.__file__],
         {
             "system_prompt": _SYSTEM_PROMPT,
+            "judge_system_prompt": ev.JUDGE_SYSTEM_PROMPT,
+            "judge_enabled": judge_enabled,
+            "judge_model": judge_model,
+            "fuzzy_threshold": fuzzy_threshold,
             "fields": fields,
             "model": model,
             "max_input_chars": max_chars,
@@ -309,7 +487,8 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
     )
     print(
         f"[gold] silver={silver_text_path}, target={fields_table}, "
-        f"model={model}, fields={len(fields)}, code={current_code}"
+        f"evidence={evidence_table}, model={model}, judge={judge_model if judge_enabled else 'off'}, "
+        f"fields={len(fields)}, code={current_code}"
     )
 
     # Active, successfully-extracted contracts only -- the *current* silver
@@ -371,25 +550,29 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
         client = get_openai_client(notebookutils)
         extracted_at = datetime.now(timezone.utc)
         rows = []
+        evidence_rows = []
+        evidence_keys = []  # relative_paths that got evidence (no extract error)
         errors = 0
 
-        # Fan the per-contract chat completions out across a bounded thread pool
-        # rather than calling them one-at-a-time on the driver. ``_extract_one``
-        # already captures its own exceptions and returns ``(values, error)``, so
-        # no call escapes the pool; ``executor.map`` preserves input order, and a
-        # single OpenAI client is safe to share across threads.
+        # Fan the per-contract work (extract + locate + judge) out across a
+        # bounded thread pool rather than one-at-a-time on the driver.
+        # ``_process_one`` captures its own exceptions and returns an error
+        # string, so no call escapes the pool; ``executor.map`` preserves input
+        # order, and a single OpenAI client is safe to share across threads.
         workers = min(max_concurrency, len(pending_rows))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            extractions = list(
+            results = list(
                 pool.map(
-                    lambda r: _extract_one(
-                        client, model, fields, r["extracted_text"], max_chars
+                    lambda r: _process_one(
+                        client, model, judge_model, fields, r["extracted_text"],
+                        max_chars, fuzzy_threshold, evidence_max_chars,
+                        judge_enabled,
                     ),
                     pending_rows,
                 )
             )
 
-        for r, (values, error) in zip(pending_rows, extractions):
+        for r, (values, error, _truncated, field_rows) in zip(pending_rows, results):
             if error:
                 errors += 1
             row = {
@@ -409,6 +592,36 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
                 row[f["field_name"]] = values.get(f["field_name"])
             rows.append(Row(**row))
 
+            # Tall evidence rows only for contracts that extracted successfully
+            # (errored contracts skip the tall write and auto-retry next run).
+            if error:
+                continue
+            evidence_keys.append(r["relative_path"])
+            for fr in field_rows:
+                evidence_rows.append(
+                    Row(
+                        evidence_id=_evidence_id(r["version_id"], fr["field_name"]),
+                        version_id=r["version_id"],
+                        relative_path=r["relative_path"],
+                        file_name=r["file_name"],
+                        field_name=fr["field_name"],
+                        value=fr["value"],
+                        evidence_text=fr["evidence_text"],
+                        match_type=fr["match_type"],
+                        judge_verdict=fr["judge_verdict"],
+                        judge_rationale=fr["judge_rationale"],
+                        judge_error=fr["judge_error"],
+                        trust=fr["trust"],
+                        contract_truncated=fr["contract_truncated"],
+                        model=model,
+                        judge_model=judge_model if judge_enabled else None,
+                        valid_from=extracted_at,
+                        valid_to=None,
+                        is_current=True,
+                        doc_deleted=False,
+                    )
+                )
+
         source_df = spark.createDataFrame(rows, schema=schema)
 
         # SCD2 upsert: a changed version expires the prior current row and
@@ -426,6 +639,24 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
         print(f"Extracted fields for {ok} of {len(rows)} contract(s).")
         if errors:
             print(f"  {errors} contract(s) failed; see 'extraction_error' column.")
+
+        # Tall evidence table: expire the prior current rows of each reprocessed
+        # contract and append the new per-field versions (many current rows per
+        # key, like ``contract_chunks``).
+        if evidence_rows:
+            evidence_df = spark.createDataFrame(evidence_rows, schema=_EVIDENCE_SCHEMA)
+            scd2_expire_and_append(
+                spark,
+                evidence_table,
+                evidence_df,
+                evidence_keys,
+                key="relative_path",
+                now=extracted_at,
+            )
+            print(
+                f"Wrote {evidence_df.count()} evidence row(s) to '{evidence_table}' "
+                f"for {len(evidence_keys)} contract(s)."
+            )
 
     # Tombstone the current gold version of contracts no longer active in silver.
     # Driven by the *active* silver set so gold self-heals when contracts are
@@ -459,3 +690,37 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
         )
         active = spark.table(fields_view).count()
         print(f"View '{fields_view}' up to date: {active} active contract(s).")
+
+    # Mirror the tombstone sync + active view onto the tall evidence table so it
+    # self-heals when contracts leave silver. ``active_paths`` is reused from the
+    # wide-table block above (same active silver set).
+    if spark.catalog.tableExists(evidence_table):
+        now_ts = locals().get("extracted_at") or datetime.now(timezone.utc)
+        active_paths = locals().get("active_paths")
+        if active_paths is None:
+            silver_active = spark.read.format("delta").load(silver_text_path).where(
+                F.col("is_current") == True  # noqa: E712
+            )
+            active_paths = [
+                r["relative_path"]
+                for r in silver_active
+                .where(F.col("doc_deleted") == False)  # noqa: E712
+                .select("relative_path")
+                .distinct()
+                .collect()
+            ]
+        ev_tgt = DeltaTable.forName(spark, evidence_table)
+        ev_tgt.update(
+            condition=(~F.col("relative_path").isin(active_paths))
+            & (F.col("is_current") == True)  # noqa: E712
+            & (F.col("doc_deleted") == False),  # noqa: E712
+            set={"doc_deleted": F.lit(True), "valid_to": F.lit(now_ts)},
+        )
+
+        spark.sql(
+            f"CREATE OR REPLACE VIEW {evidence_view} AS "
+            f"SELECT * FROM {evidence_table} "
+            f"WHERE is_current = true AND doc_deleted = false"
+        )
+        active_ev = spark.table(evidence_view).count()
+        print(f"View '{evidence_view}' up to date: {active_ev} active evidence row(s).")

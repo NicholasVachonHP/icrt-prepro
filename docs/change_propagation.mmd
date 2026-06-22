@@ -5,5 +5,5 @@ flowchart TD
     S -->|silver version_id| C["NB03 chunk<br/>contract_chunks"]
     CC["Chunk code / size / overlap change"] --> C
     C --> IDX["NB03 search_index<br/>Azure AI Search"]
-    S -->|silver version_id| G["NB04 gold<br/>contract_fields"]
-    GC["Gold prompt / fields / model change"] --> G
+    S -->|silver version_id| G["NB04 gold<br/>contract_fields<br/>+ contract_field_evidence"]
+    GC["Gold prompt / fields / model /<br/>judge prompt / fuzzy_threshold change"] --> G

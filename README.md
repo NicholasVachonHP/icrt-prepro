@@ -7,9 +7,11 @@ only the code and config that the bronze/silver/gold notebooks import.
 
 The pipeline ingests contracts (PDF / DOCX / DOC) from SharePoint, extracts and
 chunks their text, embeds the chunks into Azure AI Search for semantic
-retrieval, and uses GPT-4.1 to extract structured comparison fields — all on a
-**medallion architecture** (bronze → silver → gold) in Microsoft Fabric, with
-full **Slowly Changing Dimension Type 2 (SCD2)** version history at every layer.
+retrieval, and uses GPT-4.1 to extract structured comparison fields — each with
+the **verbatim evidence quote** it came from and an LLM-judged **trust** signal —
+all on a **medallion architecture** (bronze → silver → gold) in Microsoft Fabric,
+with full **Slowly Changing Dimension Type 2 (SCD2)** version history at every
+layer.
 
 ---
 
@@ -47,7 +49,7 @@ Files/
         ├── common/            ← shared helpers (bootstrap, config, scd2, versioning, ai_clients)
         ├── bronze/            ← ingest.py
         ├── silver/            ← extract.py, chunk.py
-        ├── gold/              ← fields.py
+        ├── gold/              ← fields.py, evidence.py
         └── serving/           ← search_index.py
 ```
 
@@ -68,6 +70,7 @@ Silver  ictr_lh_silver_dev   contract_text           (extracted plain text)
         │                Azure AI Search  (ictr_dev index, HNSW / cosine / 3072-dim)
         ▼
 Gold    ictr_lh_gold_dev     contract_fields        (10 structured fields via GPT-4.1)
+        └──────────────► contract_field_evidence  (per-field evidence quote + trust)
 ```
 
 Orchestrated by a Fabric Data Pipeline (`nb01 → nb02 → nb03 & nb04 in parallel`).
@@ -84,6 +87,7 @@ unit-reasoned, reviewed, and reused across notebooks.
 | Silver | `ictr_lh_silver_dev` | `contract_text` | `silver/extract.py` | Extracted plain text per contract version |
 | Silver | `ictr_lh_silver_dev` | `contract_chunks` | `silver/chunk.py` | Overlapping token chunks (AI Search document keys) |
 | Gold | `ictr_lh_gold_dev` | `contract_fields` | `gold/fields.py` | 10 structured fields (parties, dates, value, governing law, …) |
+| Gold | `ictr_lh_gold_dev` | `contract_field_evidence` | `gold/fields.py` + `gold/evidence.py` | One row per field per contract version: the verbatim evidence quote, `match_type` (is the quote real), `judge_verdict` (does it answer the question), and a fused `trust` (high / review / low / unknown) |
 | Serving | Azure AI Search | `ictr_dev` index | `serving/search_index.py` | Embedded live chunks for semantic / vector search |
 
 Each table also has a companion **`*_active` view** exposing only the live
@@ -121,9 +125,10 @@ The SCD2 write mechanics live in `common/scd2.py`:
   the live row in place** so corrected results actually persist without polluting
   history.
 - **`scd2_expire_and_append`** — tables with many current rows per key
-  (`contract_chunks`). Re-chunking expires the old chunk set and appends the new
-  one; an identical-version rerun uses **delete-on-same-version** so `chunk_id`
-  keys never duplicate.
+  (`contract_chunks`, `contract_field_evidence`). Re-chunking / re-extraction
+  expires the old row set and appends the new one; an identical-version rerun
+  uses **delete-on-same-version** so `chunk_id` / `evidence_id` keys never
+  duplicate.
 
 ---
 
@@ -162,7 +167,7 @@ notebook's `ENV` parameter). Key sections:
 | `lakehouse` | Names of the bronze / silver / gold / shared lakehouses |
 | `bronze` | Scan folder (`files_dir`, `scan_subdir`), target table, active view |
 | `silver` | Source bronze table, target text/chunks tables and views |
-| `gold` | Source silver text table, target fields table, `fields_config`, `max_input_chars` |
+| `gold` | Source silver text table, target fields table, `fields_config`, `max_input_chars`; evidence/trust keys (`fields_evidence_table`, `judge_enabled`, `judge_model`, `fuzzy_threshold`, `evidence_max_chars`) |
 | `serving` | Chunks source table, upload batch size |
 | `chunking` | `chunk_size` (512), `chunk_overlap` (64), `embedding_dimensions` (3072) |
 | `reprocess` | `force_paths` fallback for forced re-runs |
@@ -248,7 +253,8 @@ keys don't orphan.
 | `bronze/ingest.py` | Scan files, hash content, MERGE `contract_inventory` |
 | `silver/extract.py` | Extract text from PDF/DOCX/DOC → `contract_text` |
 | `silver/chunk.py` | Token-chunk text → `contract_chunks` |
-| `gold/fields.py` | GPT-4.1 structured field extraction → `contract_fields` |
+| `gold/fields.py` | GPT-4.1 structured field extraction → `contract_fields`, plus per-field evidence/trust → `contract_field_evidence` |
+| `gold/evidence.py` | Locate the evidence quote in the contract, LLM-judge value↔question, derive the `trust` category |
 | `serving/search_index.py` | Embed live chunks; upsert/prune the AI Search index |
 
 For the full design rationale, see

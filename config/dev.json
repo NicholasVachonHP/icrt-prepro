@@ -46,7 +46,14 @@
     "silver_text_table": "dbo/contract_text",
     "fields_table": "contract_fields",
     "fields_active_view": "contract_fields_active",
-    "fields_config": "config/extraction_fields.json"
+    "fields_config": "config/extraction_fields.json",
+    "_evidence_note": "Per-field provenance written to the tall contract_field_evidence table: the model's verbatim evidence quote, match_type (is the quote really in the contract), judge_verdict (does value+evidence answer the field question), and a fused categorical trust (high/review/low/unknown). judge_enabled=false skips the LLM judge call (extract + locate only; trust is never 'high'). judge_model defaults to MAIN_MODEL. With the judge on, each contract makes TWO gpt-4.1 calls (extract + judge), so it consumes ~2x the TPM. fuzzy_threshold is the minimum SequenceMatcher ratio for a 'fuzzy' quote match; evidence_max_chars caps the stored quote length. The judge prompt and fuzzy_threshold feed the gold code_hash, so changing them re-extracts all contracts.",
+    "fields_evidence_table": "contract_field_evidence",
+    "fields_evidence_active_view": "contract_field_evidence_active",
+    "judge_enabled": true,
+    "judge_model": null,
+    "fuzzy_threshold": 0.85,
+    "evidence_max_chars": 600
   },
   "eval": {
     "_note": "Standalone gold quality gate (contract_intelligence.eval.gold_eval). Scores contract_fields against a hand-authored ground truth derived from docs/Contract_Review.docx. Run on demand after prompt/field/model changes \u2014 not part of the daily pipeline. truth is keyed by join_key; results append to results_table in the gold lakehouse.",
