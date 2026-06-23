@@ -24,6 +24,8 @@ The judge prompts and the fuzzy threshold feed the gold ``code_hash`` (via
 import json
 from difflib import SequenceMatcher
 
+from . import validate as vld
+
 # match_type values, ordered best -> worst.
 MATCH_EXACT = "exact"
 MATCH_NORMALIZED = "normalized"
@@ -198,7 +200,9 @@ def judge_fields(client, model, fields, extractions, text, max_chars):
 # Fuse the two signals into one categorical trust value.
 # ---------------------------------------------------------------------------
 
-def derive_trust(value, match_type, judge_verdict, judge_error, judge_enabled):
+def derive_trust(
+    value, match_type, judge_verdict, judge_error, judge_enabled, validation=None
+):
     """Combine the locate result and the judge verdict into a trust category.
 
     Decision order (mitigations from the design baked in):
@@ -213,9 +217,23 @@ def derive_trust(value, match_type, judge_verdict, judge_error, judge_enabled):
     * verdict ``correct`` + quote located -> ``high``.
     * verdict ``correct`` + quote NOT located -> ``review`` (value may be right
       but the cited quote is paraphrased/unlocatable -- do not silently trust).
+
+    ``validation`` is an independent structural gate (see
+    :func:`contract_intelligence.gold.validate.validate_value`). A value that is
+    structurally ``invalid`` for its type can never be ``high``; it is demoted to
+    ``review`` so a human looks before the value is trusted. ``None`` (validation
+    disabled) leaves the verdict untouched.
     """
     if value is None:
         return TRUST_UNKNOWN
+    trust = _judge_trust(match_type, judge_verdict, judge_error, judge_enabled)
+    if validation == vld.INVALID and trust == TRUST_HIGH:
+        return TRUST_REVIEW
+    return trust
+
+
+def _judge_trust(match_type, judge_verdict, judge_error, judge_enabled):
+    """Base trust from the locate result + judge verdict (pre-validation gate)."""
     if judge_error:
         return TRUST_REVIEW
     if not judge_enabled or judge_verdict is None:
