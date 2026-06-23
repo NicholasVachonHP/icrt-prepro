@@ -1,6 +1,24 @@
 # Plan 02 — DI confidence + targeted vision verification
 
-**Status:** Proposed · **Date:** 2026-06-22 · **Scope:** silver `di_extract.py` (+ schema) and gold trust model
+**Status:** Implemented · **Date:** 2026-06-22 · **Scope:** silver `di_extract.py` (+ schema) and gold trust model
+
+> **Implemented 2026-06-23.** Both phases shipped. **Phase 1 (always-on DI
+> confidence):** `silver/di_extract.py` aggregates DI per-word read confidence
+> onto blocks (`conf_min` / `conf_mean` on `contract_blocks`) and a document
+> `di_quality` / `di_quality_flag` on `contract_text` (gated by
+> `silver.document_intelligence.persist_confidence` / `di_quality_threshold`);
+> gold locates each evidence quote's span to surface `evidence_di_confidence`
+> and `evidence_page`, and `gold/evidence.py` `derive_trust` gained a
+> `source_verified` gate (`low` can never be `high`). **Phase 2 (opt-in vision):**
+> new module `gold/vision_verify.py` renders the source page (PyMuPDF) and
+> re-reads escalated fields with a multimodal model, persisting `source_verified`,
+> `vision_verdict`, `vision_rationale`; wired into `gold/fields.run()` via the new
+> `bronze_files_dir` arg (gold notebook now mounts bronze read-only). Config gained
+> `evidence_di_confidence_threshold`, `vision_verify_enabled` (default off),
+> `vision_verify_model`, `vision_verify_max_chars`. `contract_field_evidence`
+> gained 5 columns: `evidence_di_confidence`, `evidence_page`, `source_verified`,
+> `vision_verdict`, `vision_rationale`. All new keys feed the silver/gold code
+> fingerprints, so enabling them re-extracts.
 
 ## 1. Goal
 

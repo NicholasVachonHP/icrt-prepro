@@ -41,6 +41,7 @@ from pyspark.sql import Row
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     BooleanType,
+    DoubleType,
     IntegerType,
     StringType,
     StructField,
@@ -81,6 +82,8 @@ EXTRACTION_SCHEMA = StructType(
         StructField("page_count", IntegerType(), True),     # NEW: from DI
         StructField("has_tables", BooleanType(), True),     # NEW: drives table logic
         StructField("has_figures", BooleanType(), True),    # NEW: doc contains figure(s)
+        StructField("di_quality", DoubleType(), True),      # fraction of words >= high confidence
+        StructField("di_quality_flag", StringType(), True), # ok | low (doc-level triage)
         StructField("extraction_error", StringType(), True),
         StructField("valid_from", TimestampType(), False),  # when this version began
         StructField("valid_to", TimestampType(), True),     # null while current
@@ -104,6 +107,8 @@ BLOCKS_SCHEMA = StructType(
         StructField("table_id", StringType(), True),        # links table blocks to contract_tables
         StructField("figure_uri", StringType(), True),      # figure provenance
         StructField("char_count", IntegerType(), False),
+        StructField("conf_min", DoubleType(), True),        # min DI word confidence in span
+        StructField("conf_mean", DoubleType(), True),       # mean DI word confidence in span
         StructField("content_hash", StringType(), False),
         StructField("code_hash", StringType(), False),
         StructField("valid_from", TimestampType(), False),
@@ -203,6 +208,15 @@ def run(spark, notebookutils, config=None, bronze_tables_path=None, bronze_files
     # below this fraction of the page, before captioning/persistence. 0 disables.
     min_figure_page_fraction = float(di_cfg.get("min_figure_page_fraction", 0.0))
 
+    # Persist DI per-word confidence (Plan 02): aggregate min/mean confidence onto
+    # each block and a document-level di_quality (fraction of words read at high
+    # confidence). di_quality_threshold is the fraction below which a document is
+    # flagged ``low`` (a scanned/garbled source whose text gold should not trust
+    # without a closer look). Both feed the silver code fingerprint so toggling
+    # them re-extracts existing documents under the new logic.
+    persist_confidence = bool(di_cfg.get("persist_confidence", True))
+    di_quality_threshold = float(di_cfg.get("di_quality_threshold", 0.6))
+
     if not bronze_tables_path or not bronze_files_dir:
         raise ValueError(
             "bronze_tables_path and bronze_files_dir are required; resolve them "
@@ -223,6 +237,8 @@ def run(spark, notebookutils, config=None, bronze_tables_path=None, bronze_files
             "vision_model": vision_model,
             "save_figure_images": save_figure_images,
             "min_figure_page_fraction": min_figure_page_fraction,
+            "persist_confidence": persist_confidence,
+            "di_quality_threshold": di_quality_threshold,
         },
     )
     print(f"[silver] bronze={bronze_delta_path}, table={target_table}, code={current_code} "
@@ -313,6 +329,7 @@ def run(spark, notebookutils, config=None, bronze_tables_path=None, bronze_files
                     min_figure_page_fraction=min_figure_page_fraction,
                     vision_client=vision_client,
                     vision_model=vision_model,
+                    persist_confidence=persist_confidence,
                 )
                 return row, vid, doc, None
             except Exception as e:  # noqa: BLE001 - record and keep going
@@ -332,6 +349,14 @@ def run(spark, notebookutils, config=None, bronze_tables_path=None, bronze_files
             if error:
                 errors[rel] = error
 
+            di_quality = doc["di_quality"] if doc else None
+            # Doc-level triage flag: ``low`` when too few words read confidently,
+            # ``ok`` when they did, ``None`` when no confidence data is available.
+            if di_quality is None:
+                di_quality_flag = None
+            else:
+                di_quality_flag = "low" if di_quality < di_quality_threshold else "ok"
+
             text_rows.append(
                 Row(
                     version_id=vid,
@@ -343,6 +368,8 @@ def run(spark, notebookutils, config=None, bronze_tables_path=None, bronze_files
                     page_count=(doc["page_count"] if doc else None),
                     has_tables=(doc["has_tables"] if doc else None),
                     has_figures=(doc["has_figures"] if doc else None),
+                    di_quality=di_quality,
+                    di_quality_flag=di_quality_flag,
                     extraction_error=error,
                     valid_from=extracted_at,
                     valid_to=None,
@@ -374,6 +401,8 @@ def run(spark, notebookutils, config=None, bronze_tables_path=None, bronze_files
                         table_id=b["table_id"],
                         figure_uri=b["figure_uri"],
                         char_count=int(b["char_count"]),
+                        conf_min=b.get("conf_min"),
+                        conf_mean=b.get("conf_mean"),
                         content_hash=row["content_hash"],
                         code_hash=current_code,
                         valid_from=extracted_at,

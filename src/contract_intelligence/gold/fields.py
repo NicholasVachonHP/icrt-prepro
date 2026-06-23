@@ -56,6 +56,7 @@ from . import retrieval
 from . import scheduler
 from . import strategy as strat
 from . import validate as vld
+from . import vision_verify
 from ..common.ai_clients import get_openai_client
 from ..common.versioning import code_fingerprint
 from ..common.scd2 import (
@@ -110,6 +111,11 @@ _EVIDENCE_META = [
     StructField("judge_verdict", StringType(), True),    # answers the question?
     StructField("judge_rationale", StringType(), True),
     StructField("judge_error", StringType(), True),      # non-fatal judge failure
+    StructField("evidence_di_confidence", DoubleType(), True),  # DI conf of evidence span (Plan 02)
+    StructField("evidence_page", IntegerType(), True),   # source page of the evidence block
+    StructField("source_verified", StringType(), True),  # high/low/confirmed (Source->DI gate)
+    StructField("vision_verdict", StringType(), True),   # confirmed/contradicted/unclear (Phase 2)
+    StructField("vision_rationale", StringType(), True), # one-line vision justification
     StructField("trust", StringType(), False),           # high/review/low/unknown
     StructField("contract_truncated", BooleanType(), False),
     StructField("model", StringType(), True),
@@ -571,16 +577,22 @@ def _union_partials(partials, name, field):
 def _finalize_contract(
     fields, strategies, text, values, evidence, chunk_ids_by_field, verdicts,
     judge_error, judge_enabled, max_chars, fuzzy_threshold, evidence_max_chars,
-    type_validation_enabled, error,
+    type_validation_enabled, blocks, di_quality_flag, di_conf_threshold, error,
 ):
     """Locate evidence, validate, and derive trust for one contract's merged
     extraction. Returns ``(values, error, truncated, field_rows)`` -- the shape
     the wide/tall writers consume. On extraction ``error`` no field rows are
-    produced (the contract auto-retries next run, like the wide table)."""
+    produced (the contract auto-retries next run, like the wide table).
+
+    ``blocks`` are the contract's silver semantic blocks (with DI ``conf_min``);
+    together with ``di_quality_flag`` and ``di_conf_threshold`` they drive the
+    Source->DI confidence gate (Plan 02): each field's evidence span confidence
+    becomes ``source_verified`` (``low`` demotes a ``high`` trust to ``review``)."""
     if error:
         return values, error, False, []
 
     truncated = len(text) > max_chars
+    doc_low = di_quality_flag == "low"
     field_rows = []
     for f in fields:
         name = f["field_name"]
@@ -599,8 +611,24 @@ def _finalize_contract(
         validation = (
             vld.validate_value(values.get(name), f) if type_validation_enabled else None
         )
+
+        # Source->DI confidence: read the DI conf_min / page of the block the
+        # evidence quote came from, then classify how well the source backs it.
+        evidence_di_confidence, evidence_page = _block_confidence_for_quote(
+            quote, blocks
+        )
+        if doc_low:
+            source_verified = ev.SOURCE_LOW   # whole document scanned poorly
+        elif evidence_di_confidence is None:
+            source_verified = None            # no confidence signal for this span
+        elif evidence_di_confidence < di_conf_threshold:
+            source_verified = ev.SOURCE_LOW   # DI read the cited span poorly
+        else:
+            source_verified = ev.SOURCE_HIGH
+
         trust = ev.derive_trust(
-            value_str, match_type, verdict, judge_error, judge_enabled, validation
+            value_str, match_type, verdict, judge_error, judge_enabled, validation,
+            source_verified,
         )
         if quote and evidence_max_chars and len(quote) > evidence_max_chars:
             quote = quote[:evidence_max_chars]
@@ -617,6 +645,11 @@ def _finalize_contract(
                 "judge_verdict": verdict,
                 "judge_rationale": rationale,
                 "judge_error": judge_error,
+                "evidence_di_confidence": evidence_di_confidence,
+                "evidence_page": evidence_page,
+                "source_verified": source_verified,
+                "vision_verdict": None,
+                "vision_rationale": None,
                 "trust": trust,
                 "contract_truncated": truncated,
             }
@@ -625,11 +658,11 @@ def _finalize_contract(
 
 
 def _extract_all_contracts(
-    client, search_client, chunks_by_path, tables_by_path, fields, groups,
-    strategies, pending_rows,
+    client, search_client, chunks_by_path, tables_by_path, blocks_by_path, fields,
+    groups, strategies, pending_rows,
     *, model, judge_model, max_chars, fuzzy_threshold, evidence_max_chars,
     judge_enabled, structured_output, type_validation_enabled, retrieval_top_k,
-    retrieval_min_chunks, token_budget,
+    retrieval_min_chunks, token_budget, di_conf_threshold,
 ):
     """Extract every pending contract under one global token budget.
 
@@ -831,12 +864,15 @@ def _extract_all_contracts(
     results = []
     for ctx in contexts:
         error = "; ".join(ctx["errors"]) if ctx["errors"] else None
+        rel = ctx["row"]["relative_path"]
+        di_quality_flag = ctx["row"].asDict().get("di_quality_flag")
         results.append(
             _finalize_contract(
                 fields, strategies, ctx["text"], ctx["values"], ctx["evidence"],
                 ctx["chunk_ids_by_field"], ctx["verdicts"], ctx["judge_error"],
                 judge_enabled, max_chars, fuzzy_threshold, evidence_max_chars,
-                type_validation_enabled, error,
+                type_validation_enabled, blocks_by_path.get(rel),
+                di_quality_flag, di_conf_threshold, error,
             )
         )
     return results
@@ -862,7 +898,7 @@ def _load_tables_by_path(spark, silver_tables_path, cfg, pending_paths):
     Reads the *current*, non-deleted rows of the silver tables table once on the
     driver. Returns ``{relative_path: [{table_index, page, markdown}, ...]}``, or
     an empty dict if the table is absent (callers then use full text)."""
-    tables_table = cfg.get("silver", {}).get("tables_table", "contract_tables")
+    tables_table = cfg.get("gold", {}).get("silver_tables_table", "dbo/contract_tables")
     tables_path = f"{silver_tables_path}/{tables_table}"
     try:
         df = spark.read.format("delta").load(tables_path)
@@ -898,7 +934,7 @@ def _load_chunks_by_path(spark, silver_tables_path, cfg, pending_paths):
     Reads the *current*, non-deleted rows of the silver chunks table once on the
     driver. Returns ``{relative_path: [{chunk_id, text, chunk_index}, ...]}``, or
     an empty dict if the table is absent (callers then use full text)."""
-    chunks_table = cfg.get("silver", {}).get("chunks_table", "contract_chunks")
+    chunks_table = cfg.get("gold", {}).get("silver_chunks_table", "dbo/contract_chunks")
     chunks_path = f"{silver_tables_path}/{chunks_table}"
     try:
         df = spark.read.format("delta").load(chunks_path)
@@ -927,7 +963,73 @@ def _load_chunks_by_path(spark, silver_tables_path, cfg, pending_paths):
     return by_path
 
 
-def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=None):
+def _load_blocks_by_path(spark, silver_tables_path, cfg, pending_paths):
+    """Load silver semantic blocks (with DI confidence) for the pending
+    contracts, grouped by ``relative_path`` and ordered by ``block_index``.
+
+    Used by the Source->DI confidence gate (Plan 02): each extracted field's
+    evidence quote is located within these blocks to read the DI ``conf_min`` of
+    the span it came from and the source ``page``. Reads the *current*,
+    non-deleted rows once on the driver. Returns
+    ``{relative_path: [{page, text, conf_min}, ...]}`` (empty if the table or the
+    ``conf_min`` column is absent -- the gate then degrades to ``None``)."""
+    blocks_table = cfg.get("gold", {}).get("silver_blocks_table", "dbo/contract_blocks")
+    blocks_path = f"{silver_tables_path}/{blocks_table}"
+    try:
+        df = spark.read.format("delta").load(blocks_path)
+    except Exception as e:  # noqa: BLE001 - no blocks -> confidence gate disabled
+        print(f"[gold] DI confidence: blocks unavailable ({e}); gate disabled.")
+        return {}
+    has_conf = "conf_min" in df.columns
+    df = df.where(
+        (F.col("is_current") == True)  # noqa: E712
+        & (F.col("doc_deleted") == False)  # noqa: E712
+        & F.col("relative_path").isin(pending_paths)
+    )
+    if not has_conf:
+        # Pre-Plan-02 blocks table (no confidence persisted yet): expose the
+        # rows but with null confidence so the gate is a clean no-op.
+        df = df.withColumn("conf_min", F.lit(None).cast("double"))
+    rows = (
+        df.select("relative_path", "block_index", "page", "text", "conf_min")
+        .orderBy("relative_path", "block_index")
+        .collect()
+    )
+    by_path = {}
+    for r in rows:
+        by_path.setdefault(r["relative_path"], []).append(
+            {
+                "page": r["page"],
+                "text": r["text"],
+                "conf_min": r["conf_min"],
+            }
+        )
+    return by_path
+
+
+def _block_confidence_for_quote(quote, blocks):
+    """Find the DI confidence and source page backing one evidence quote.
+
+    Locates the first block whose (whitespace-normalised) text contains the
+    (whitespace-normalised) quote and returns ``(conf_min, page)`` for it.
+    Returns ``(None, None)`` when there is no quote, no blocks, or no containing
+    block -- the confidence gate then leaves ``source_verified`` unset."""
+    if not quote or not blocks:
+        return None, None
+    needle = " ".join(quote.split()).lower()
+    if not needle:
+        return None, None
+    for b in blocks:
+        text = b.get("text")
+        if not text:
+            continue
+        if needle in " ".join(text.split()).lower():
+            return b.get("conf_min"), b.get("page")
+    return None, None
+
+
+def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=None,
+        bronze_files_dir=None):
     """Extract structured comparison fields from silver text into the gold table.
 
     Args:
@@ -939,6 +1041,11 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
         force_paths: Optional list of ``relative_path`` values (or the string
             "ALL") to force-reprocess even when unchanged; falls back to the
             ``reprocess.force_paths`` config key.
+        bronze_files_dir: Optional path to the bronze ``Files`` area holding the
+            original source documents. Required only for Phase 2 vision
+            verification (Plan 02): escalated fields render their source page from
+            ``{bronze_files_dir}/{relative_path}``. When ``None`` (or vision is
+            disabled) vision verification is a clean no-op.
     """
     cfg = config or {}
     gold_cfg = cfg.get("gold", {})
@@ -983,8 +1090,29 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
     retrieval_top_k = int(gold_cfg.get("retrieval_top_k", 6))
     retrieval_min_chunks = int(gold_cfg.get("retrieval_min_chunks", 3))
     token_budget = int(gold_cfg.get("token_budget", 500_000))
+    # Source->DI confidence gate (Plan 02): an evidence span whose DI conf_min is
+    # below this threshold (or whose document scored di_quality_flag == 'low') is
+    # marked source_verified='low', which can never be 'high' trust. Part of the
+    # code fingerprint so tuning it re-derives trust over existing contracts.
+    evidence_di_confidence_threshold = float(
+        gold_cfg.get("evidence_di_confidence_threshold", 0.7)
+    )
+    # Phase 2 targeted vision verification (Plan 02). When enabled and the bronze
+    # source files are reachable (bronze_files_dir), escalated fields have their
+    # source page re-read by a multimodal model. vision_verify_model defaults to
+    # the main (vision-capable) model. All three feed the code fingerprint so
+    # toggling them re-derives trust over existing contracts.
+    vision_verify_enabled = bool(gold_cfg.get("vision_verify_enabled", False))
+    vision_verify_max_chars = int(gold_cfg.get("vision_verify_max_chars", 4000))
     model = os.environ.get("MAIN_MODEL") or cfg.get("azure_openai", {}).get(
         "completion_model", "gpt-4.1"
+    )
+    # Vision verification model: explicit config override, else the silver DI
+    # vision model, else the main (vision-capable) model.
+    vision_verify_model = (
+        gold_cfg.get("vision_verify_model")
+        or cfg.get("silver", {}).get("document_intelligence", {}).get("vision_model")
+        or model
     )
     # Judge model defaults to the main model unless overridden.
     judge_model = (
@@ -1006,7 +1134,7 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
     # the model, the input cap, or the evidence/judge knobs.
     current_code = code_fingerprint(
         [__file__, ev.__file__, strat.__file__, vld.__file__, retrieval.__file__,
-         scheduler.__file__],
+         scheduler.__file__, vision_verify.__file__],
         {
             "system_prompt": _SYSTEM_PROMPT,
             "judge_system_prompt": ev.JUDGE_SYSTEM_PROMPT,
@@ -1017,6 +1145,10 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
             "type_validation_enabled": type_validation_enabled,
             "retrieval_top_k": retrieval_top_k,
             "retrieval_min_chunks": retrieval_min_chunks,
+            "evidence_di_confidence_threshold": evidence_di_confidence_threshold,
+            "vision_verify_enabled": vision_verify_enabled,
+            "vision_verify_model": vision_verify_model,
+            "vision_verify_max_chars": vision_verify_max_chars,
             "strategies": strategies,
             "fields": fields,
             "model": model,
@@ -1039,11 +1171,19 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
     silver_df = spark.read.format("delta").load(silver_text_path).where(
         F.col("is_current") == True  # noqa: E712
     )
+    # Carry the document-level DI quality flag through to gold for the
+    # Source->DI confidence gate. Older silver tables predate Plan 02 and lack
+    # the column; default it to null so the gate degrades to a clean no-op.
+    if "di_quality_flag" not in silver_df.columns:
+        silver_df = silver_df.withColumn(
+            "di_quality_flag", F.lit(None).cast("string")
+        )
     source = (
         silver_df
         .where((F.col("doc_deleted") == False) & F.col("extracted_text").isNotNull())  # noqa: E712
         .select(
             "relative_path", "file_name", "content_hash", "extracted_text",
+            "di_quality_flag",
             F.col("version_id").alias("silver_version_id"),
         )
         .withColumn("code_hash", F.lit(current_code))
@@ -1108,6 +1248,12 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
             tables_by_path = _load_tables_by_path(
                 spark, silver_tables_path, cfg, pending_paths
             )
+        # Silver semantic blocks (with DI conf_min) back the Source->DI
+        # confidence gate; loaded unconditionally since every field's evidence is
+        # scored against them.
+        blocks_by_path = _load_blocks_by_path(
+            spark, silver_tables_path, cfg, pending_paths
+        )
         needs_search = any(
             s in groups for s in (strat.RETRIEVE_CLASSIFY, strat.RAG)
         )
@@ -1120,14 +1266,72 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
         # ``(values, error, truncated, field_rows)`` tuple per pending row, in
         # input order.
         results = _extract_all_contracts(
-            client, search_client, chunks_by_path, tables_by_path, fields, groups,
-            strategies, pending_rows,
+            client, search_client, chunks_by_path, tables_by_path, blocks_by_path,
+            fields, groups, strategies, pending_rows,
             model=model, judge_model=judge_model, max_chars=max_chars,
             fuzzy_threshold=fuzzy_threshold, evidence_max_chars=evidence_max_chars,
             judge_enabled=judge_enabled, structured_output=structured_output,
             type_validation_enabled=type_validation_enabled, retrieval_top_k=retrieval_top_k,
             retrieval_min_chunks=retrieval_min_chunks, token_budget=token_budget,
+            di_conf_threshold=evidence_di_confidence_threshold,
         )
+
+        # ---- Phase 2: targeted vision verification (Plan 02) ----
+        # Re-read the original source page with a multimodal model for the small
+        # subset of escalated fields, fold the verdict into source_verified and
+        # re-derive trust. A clean no-op unless enabled, the bronze source files
+        # are reachable, and a field has a page anchor to render.
+        if vision_verify_enabled and bronze_files_dir:
+            questions = {
+                f["field_name"]: f.get("question", f["field_name"]) for f in fields
+            }
+            page_cache = {}   # (relative_path, page) -> png bytes | None
+            verified_n = 0
+            for r, (_v, error, _t, field_rows) in zip(pending_rows, results):
+                if error or not field_rows:
+                    continue
+                rel = r["relative_path"]
+                di_quality_flag = r.asDict().get("di_quality_flag")
+                file_path = f"{bronze_files_dir}/{rel}"
+                for fr in field_rows:
+                    if fr["value"] is None:
+                        continue            # nothing to verify
+                    page = fr["evidence_page"]
+                    if page is None:
+                        continue            # no page anchor to render
+                    conf = fr["evidence_di_confidence"]
+                    escalate = (
+                        fr["match_type"] in (ev.MATCH_FUZZY, ev.MATCH_NOT_FOUND)
+                        or fr["trust"] in (ev.TRUST_REVIEW, ev.TRUST_LOW)
+                        or (conf is not None and conf < evidence_di_confidence_threshold)
+                        or di_quality_flag == "low"
+                    )
+                    if not escalate:
+                        continue
+                    key = (rel, page)
+                    if key not in page_cache:
+                        page_cache[key] = vision_verify.render_page_png(file_path, page)
+                    png = page_cache[key]
+                    if not png:
+                        continue
+                    verdict, rationale = vision_verify.verify_field(
+                        client, vision_verify_model, png,
+                        questions.get(fr["field_name"], fr["field_name"]),
+                        fr["value"], max_chars=vision_verify_max_chars,
+                    )
+                    fr["vision_verdict"] = verdict
+                    fr["vision_rationale"] = rationale
+                    fr["source_verified"] = vision_verify.verdict_to_source_verified(
+                        verdict, fr["source_verified"]
+                    )
+                    fr["trust"] = ev.derive_trust(
+                        fr["value"], fr["match_type"], fr["judge_verdict"],
+                        fr["judge_error"], judge_enabled, fr["type_validation"],
+                        fr["source_verified"],
+                    )
+                    verified_n += 1
+            if verified_n:
+                print(f"[gold] vision verification escalated {verified_n} field(s).")
 
         for r, (values, error, _truncated, field_rows) in zip(pending_rows, results):
             if error:
@@ -1171,6 +1375,11 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
                         judge_verdict=fr["judge_verdict"],
                         judge_rationale=fr["judge_rationale"],
                         judge_error=fr["judge_error"],
+                        evidence_di_confidence=fr["evidence_di_confidence"],
+                        evidence_page=fr["evidence_page"],
+                        source_verified=fr["source_verified"],
+                        vision_verdict=fr["vision_verdict"],
+                        vision_rationale=fr["vision_rationale"],
                         trust=fr["trust"],
                         contract_truncated=fr["contract_truncated"],
                         model=model,

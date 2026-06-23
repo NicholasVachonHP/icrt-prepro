@@ -47,13 +47,14 @@ Files/
 │   ├── ADR_ContractIntelligence_2026-06-08.md
 │   ├── ICTR_Architecture.mmd      ← Mermaid architecture diagram
 │   ├── change_propagation.mmd     ← what triggers re-processing per stage
+│   ├── trust_derivation.mmd       ← how per-field trust (high/review/low) is decided
 │   └── plans/                     ← incremental design plans (PLAN_01, PLAN_02, …)
 └── src/
     └── contract_intelligence/
         ├── common/            ← shared helpers (bootstrap, config, scd2, versioning, ai_clients)
         ├── bronze/            ← ingest.py
-        ├── silver/            ← extract.py, chunk.py
-        ├── gold/              ← fields.py, evidence.py, strategy.py, retrieval.py, validate.py, scheduler.py
+        ├── silver/            ← extract.py, di_extract.py, chunk.py
+        ├── gold/              ← fields.py, evidence.py, strategy.py, retrieval.py, validate.py, vision_verify.py, scheduler.py
         └── serving/           ← search_index.py
 ```
 
@@ -88,10 +89,10 @@ unit-reasoned, reviewed, and reused across notebooks.
 | Layer | Lakehouse | Table | Produced by | Contents |
 |-------|-----------|-------|-------------|----------|
 | Bronze | `ictr_lh_bronze_dev` | `contract_inventory` | `bronze/ingest.py` | One row per file content version: name, path, size, `content_hash` |
-| Silver | `ictr_lh_silver_dev` | `contract_text` | `silver/extract.py` | Extracted plain text per contract version |
+| Silver | `ictr_lh_silver_dev` | `contract_text` | `silver/extract.py` | Extracted plain text per contract version; `di_quality` / `di_quality_flag` = document-level Document Intelligence OCR read confidence |
 | Silver | `ictr_lh_silver_dev` | `contract_chunks` | `silver/chunk.py` | Overlapping token chunks (AI Search document keys) |
 | Gold | `ictr_lh_gold_dev` | `contract_fields` | `gold/fields.py` | 14 structured fields (parties, dates, value, governing law, …), each routed to a type-driven extraction strategy |
-| Gold | `ictr_lh_gold_dev` | `contract_field_evidence` | `gold/fields.py` + `gold/evidence.py` | One row per field per contract version: the `extraction_strategy` used, the verbatim evidence quote, `match_type` (is the quote real), `retrieved_chunk_ids` (RAG provenance), a deterministic `type_validation` (does the value match its declared type), `judge_verdict` (does it answer the question), and a fused `trust` (high / review / low / unknown) |
+| Gold | `ictr_lh_gold_dev` | `contract_field_evidence` | `gold/fields.py` + `gold/evidence.py` | One row per field per contract version: the `extraction_strategy` used, the verbatim evidence quote, `match_type` (is the quote real), `retrieved_chunk_ids` (RAG provenance), a deterministic `type_validation` (does the value match its declared type), `judge_verdict` (does it answer the question), the source-fidelity signals `evidence_di_confidence` / `evidence_page` / `source_verified` and optional `vision_verdict` / `vision_rationale`, and a fused `trust` (high / review / low / unknown) |
 | Serving | Azure AI Search | `ictr_dev` index | `serving/search_index.py` | Embedded live chunks for semantic / vector search |
 
 Each table also has a companion **`*_active` view** exposing only the live
@@ -120,6 +121,70 @@ a structurally invalid value can never be `high` trust. All LLM calls across all
 contracts run through one **token-budget work queue** (`gold/scheduler.py`) that
 admits calls only while in-flight tokens stay under a TPM-safe cap — replacing
 the old per-contract thread pool.
+
+### 3.2 Source-fidelity signals (DI confidence & vision verification)
+
+Beyond *did the model answer the question*, gold also asks *can we trust the
+underlying OCR*. Document Intelligence returns a per-word read confidence:
+
+- **Silver** (`silver/di_extract.py`, on when `silver.document_intelligence.persist_confidence`)
+  aggregates it onto every block (`conf_min` / `conf_mean` on `contract_blocks`)
+  and computes a document-level `di_quality` (fraction of words read at ≥ 0.9)
+  on `contract_text`, flagged `di_quality_flag = low` below `di_quality_threshold`.
+- **Gold** (`gold/fields.py`) locates each field's evidence quote inside those
+  blocks to read its span confidence (`evidence_di_confidence`) and source
+  `evidence_page`. A span below `gold.evidence_di_confidence_threshold`, or a
+  document flagged `di_quality_flag = low`, sets `source_verified = low`, which
+  is a **hard gate in `derive_trust`** — a low-fidelity source can never be `high`
+  (it is demoted to `review`).
+- **Targeted vision verification** (`gold/vision_verify.py`, opt-in via
+  `gold.vision_verify_enabled`) only fires for *escalated* fields — fuzzy /
+  not-found quote match, `review` / `low` trust, low DI confidence, or low
+  `di_quality`. It renders the original source PDF page to an image (PyMuPDF) and
+  re-reads the value with a multimodal model (`vision_verify_model`, defaults to
+  the main model). A **confirmed** page can restore `high`; a **contradiction**
+  sets `source_verified = low` (never `high`); **unclear** leaves the prior
+  signal. It is best-effort and a clean no-op when disabled, when the bronze
+  source files aren't mounted, or when the page can't be rendered.
+
+### 3.3 Trust derivation
+
+The per-field `trust` on `contract_field_evidence` is **categorical** (no numeric
+score) and fully deterministic given the upstream signals. It is computed by
+`derive_trust` in `gold/evidence.py` in two steps — a **base trust** from the
+quote-match + LLM judge, then two **downgrade gates** that can only ever turn a
+base `high` into `review`:
+
+**Step A — base trust** (`_judge_trust`):
+
+| Condition | Base trust |
+|-----------|------------|
+| `value is null` | **unknown** (short-circuits — gates skipped) |
+| judge errored | **review** |
+| judge disabled / no verdict — quote located (`exact`/`normalized`/`fuzzy`) | **review** |
+| judge disabled / no verdict — quote not found | **unknown** |
+| judge verdict `incorrect` | **low** |
+| judge verdict `partial` | **review** |
+| judge verdict `unverifiable` | **unknown** |
+| judge verdict `correct` + quote located | **high** |
+| judge verdict `correct` + quote NOT located | **review** |
+
+**Step B — downgrade gates** (applied only when base trust is `high`):
+
+| Gate | Source | Effect |
+|------|--------|--------|
+| `type_validation == invalid` | `gold/validate.py` (Plan 01) | `high → review` |
+| `source_verified == low` | DI confidence + vision (Plan 02) | `high → review` |
+
+The gates are **one-directional**: `source_verified` of `high` / `confirmed` /
+`None` leaves the verdict untouched, which is what lets a vision *confirmation*
+preserve (or restore) a genuine `high`. Vision is **not** a separate gate — its
+verdict is folded into the single `source_verified` signal first (vision
+`confirmed → confirmed`, `contradicted → low`, `unclear →` unchanged), so a
+vision contradiction is enforced through the same `source_verified == low` row.
+
+See the full decision flow in
+[docs/trust_derivation.mmd](docs/trust_derivation.mmd).
 
 ---
 
@@ -194,8 +259,8 @@ notebook's `ENV` parameter). Key sections:
 |---------|---------|
 | `lakehouse` | Names of the bronze / silver / gold / shared lakehouses |
 | `bronze` | Scan folder (`files_dir`, `scan_subdir`), target table, active view |
-| `silver` | Source bronze table, target text/chunks tables and views |
-| `gold` | Source silver text table, target fields table, `fields_config`, `max_input_chars`; evidence/trust keys (`fields_evidence_table`, `judge_enabled`, `judge_model`, `fuzzy_threshold`, `evidence_max_chars`); typed-extraction keys (`structured_output`, `type_validation_enabled`, `retrieval_top_k`, `retrieval_min_chunks`, `token_budget`) |
+| `silver` | Source bronze table, target text/chunks tables and views; Document Intelligence keys including `persist_confidence`, `di_quality_threshold` (see [§3.2](#32-source-fidelity-signals-di-confidence--vision-verification)) |
+| `gold` | Source silver text table, target fields table, `fields_config`, `max_input_chars`; evidence/trust keys (`fields_evidence_table`, `judge_enabled`, `judge_model`, `fuzzy_threshold`, `evidence_max_chars`); typed-extraction keys (`structured_output`, `type_validation_enabled`, `retrieval_top_k`, `retrieval_min_chunks`, `token_budget`); source-fidelity keys (`evidence_di_confidence_threshold`, `vision_verify_enabled`, `vision_verify_model`, `vision_verify_max_chars`) |
 | `serving` | Chunks source table, upload batch size |
 | `chunking` | `chunk_size` (512), `chunk_overlap` (64), `embedding_dimensions` (3072) |
 | `reprocess` | `force_paths` fallback for forced re-runs |
@@ -245,7 +310,7 @@ Each orchestration notebook is intentionally thin:
 | 01 | `ictr_nb_01_bronze_ingest` | bronze | — | `bronze.ingest.ingest()` |
 | 02 | `ictr_nb_02_silver_extract` | silver | bronze (read) | `silver.extract.run()` |
 | 03 | `ictr_nb_03_silver_chunk_embed_index` | silver | — | `silver.chunk.run()` + `serving.search_index.run()` |
-| 04 | `ictr_nb_04_gold_fields` | gold | silver (read) | `gold.fields.run()` |
+| 04 | `ictr_nb_04_gold_fields` | gold | silver (read), bronze (read, for vision page render) | `gold.fields.run()` |
 
 Run order: **01 → 02 → (03 ‖ 04)**. Set the `ENV` parameter (`"dev"` / `"prod"`)
 at the top of each notebook; set `FORCE_PATHS` only when recovering specific
@@ -281,12 +346,14 @@ keys don't orphan.
 | `common/ai_clients.py` | Azure OpenAI client + embedding helpers |
 | `bronze/ingest.py` | Scan files, hash content, MERGE `contract_inventory` |
 | `silver/extract.py` | Extract text from PDF/DOCX/DOC → `contract_text` |
+| `silver/di_extract.py` | Azure Document Intelligence layout extraction → blocks/tables/figures, with per-word OCR confidence aggregated onto blocks and a document `di_quality` |
 | `silver/chunk.py` | Token-chunk text → `contract_chunks` |
 | `gold/fields.py` | Orchestrates typed field extraction (route → group → retrieve → extract → validate → judge → trust) → `contract_fields` + `contract_field_evidence` |
-| `gold/evidence.py` | Locate the evidence quote in the contract, LLM-judge value↔question, derive the `trust` category |
+| `gold/evidence.py` | Locate the evidence quote in the contract, LLM-judge value↔question, fuse DI confidence / vision `source_verified` and `type_validation` gates into the `trust` category |
 | `gold/strategy.py` | Resolve each field to a type-driven extraction strategy and group fields that share one |
 | `gold/retrieval.py` | Thin Azure AI Search client: retrieve top-k relevant chunks per field question (server-side vectorizer) |
 | `gold/validate.py` | Deterministic per-type validation of extracted values (the `type_validation` signal feeding trust) |
+| `gold/vision_verify.py` | Render the source page to an image and re-read escalated fields with a multimodal model (`source_verified` confirm/contradict) |
 | `gold/scheduler.py` | Token-budget work queue admitting LLM calls under a TPM-safe in-flight token cap |
 | `serving/search_index.py` | Embed live chunks; upsert/prune the AI Search index |
 

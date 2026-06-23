@@ -32,7 +32,10 @@
       "save_figure_images": true,
       "figures_subdir": "contract_figures",
       "figures_root": "/lakehouse/default/Files",
-      "min_figure_page_fraction": 0.02
+      "min_figure_page_fraction": 0.02,
+      "_confidence_note": "Plan 02 Source->DI layer. persist_confidence aggregates DI per-word OCR confidence onto each block (conf_min/conf_mean on contract_blocks) and a document-level di_quality (fraction of words read at high confidence, >=0.9) on contract_text, flagged di_quality_flag=low below di_quality_threshold. Both feed the silver code fingerprint, so toggling them re-extracts every contract.",
+      "persist_confidence": true,
+      "di_quality_threshold": 0.6
     }
   },
   "serving": {
@@ -42,7 +45,11 @@
   "gold": {
     "_max_concurrency_note": "Threads running gpt-4.1 field extraction concurrently (gold.max_concurrency). TOKEN-bound, not request-bound: each call sends a full contract, so tokens-per-minute (TPM) is the ceiling. Deployment gpt-4.1 (Global Standard, UK South) is allocated 750K TPM. 8 keeps momentary in-flight tokens well under 750K even for large contracts, with headroom for retries; the SDK retries 429s automatically. Confirm the prod deployment's TPM in the Foundry portal (Management center > Quota) and adjust if prod differs from dev.",
     "max_concurrency": 8,
+    "_silver_path_tables_note": "Gold reads the silver lakehouse by PATH (silver is mounted, not attached), and the silver lakehouse is schema-enabled, so its delta tables live under Tables/dbo/. These keys carry the dbo/ schema prefix the gold path loaders require; the bare silver.* names are the catalog names silver's own attached notebooks use.",
     "silver_text_table": "dbo/contract_text",
+    "silver_blocks_table": "dbo/contract_blocks",
+    "silver_chunks_table": "dbo/contract_chunks",
+    "silver_tables_table": "dbo/contract_tables",
     "fields_table": "contract_fields",
     "fields_active_view": "contract_fields_active",
     "fields_config": "config/extraction_fields.json",
@@ -60,6 +67,12 @@
     "_retrieval_note": "Per-strategy retrieval (gold/retrieval.py). RAG / retrieve-classify field groups pull the retrieval_top_k most relevant chunks per field question from the existing AI Search index (server-side vectorizer, same embedding model as ingest), filtered to the one contract; a group returning fewer than retrieval_min_chunks hits falls back to full text so recall never regresses. AI Search endpoint/key are read from env (AZURE_SEARCH_ENDPOINT / AZURE_SEARCH_API_KEY); absent => full-text fallback. retrieval_top_k and retrieval_min_chunks feed the gold code_hash (changing them re-extracts all contracts).",
     "retrieval_top_k": 6,
     "retrieval_min_chunks": 3,
+    "_confidence_gate_note": "Plan 02 Source->DI confidence gate. Each field's evidence quote is located within the silver blocks to read the DI conf_min of its span (evidence_di_confidence) and source page (evidence_page). A span below evidence_di_confidence_threshold, or a document scored di_quality_flag=low, sets source_verified=low which can never be 'high' trust (demoted to review). Feeds the gold code_hash, so changing it re-derives trust for all contracts.",
+    "evidence_di_confidence_threshold": 0.7,
+    "_vision_verify_note": "Plan 02 Phase 2 targeted vision verification. When vision_verify_enabled and the bronze source files are reachable, escalated fields (fuzzy/not_found match, review/low trust, low DI confidence, or low di_quality) have their source PDF page rendered to an image and re-read by a multimodal model (vision_verify_model, defaults to MAIN_MODEL) to confirm/contradict the value. A confirmed page can restore 'high'; a contradiction sets source_verified=low so the field can never be 'high' (demoted to review). vision_verify_max_chars caps the value text shown to the model. Best-effort: a no-op when disabled, source files absent, or rendering unavailable. Feeds the gold code_hash.",
+    "vision_verify_enabled": true,
+    "vision_verify_model": null,
+    "vision_verify_max_chars": 4000,
     "_token_budget_note": "Caps the summed in-flight token cost across the global gold work queue (gold/scheduler.py), which fans every model call from every contract (extraction -> reduce -> judge) into one pool throttled by tokens, not a fixed thread count. Set below the gpt-4.1 deployment's per-minute token ceiling (750K TPM); 500K leaves headroom for SDK 429 retries. Pure runtime knob \u2014 NOT part of the code fingerprint, so tuning it never forces reprocessing. Replaces the now-ignored max_concurrency.",
     "token_budget": 500000
   },

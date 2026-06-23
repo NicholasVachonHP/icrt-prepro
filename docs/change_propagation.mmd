@@ -1,9 +1,9 @@
 flowchart TD
     F["Raw file change<br/>or bronze code"] --> B["NB01 bronze<br/>contract_inventory<br/>(content_hash + code_hash)"]
     B -->|new content_hash| S
-    SC["Silver/DI code change"] --> S["NB02 silver<br/>contract_text / _blocks / _tables<br/>(silver version_id)"]
+    SC["Silver/DI code change /<br/>persist_confidence / di_quality_threshold"] --> S["NB02 silver<br/>contract_text / _blocks / _tables<br/>(silver version_id)<br/>+ DI confidence: conf_min/conf_mean,<br/>di_quality / di_quality_flag"]
     S -->|silver version_id| C["NB03 chunk<br/>contract_chunks"]
     CC["Chunk code / size / overlap change"] --> C
     C --> IDX["NB03 search_index<br/>Azure AI Search"]
     S -->|silver version_id| G["NB04 gold<br/>contract_fields<br/>+ contract_field_evidence"]
-    GC["Gold prompt / fields / model / strategy /<br/>retrieval / validation / judge prompt /<br/>fuzzy_threshold change"] --> G
+    GC["Gold prompt / fields / model / strategy /<br/>retrieval / validation / judge prompt /<br/>fuzzy_threshold / DI confidence gate /<br/>vision verify change"] --> G

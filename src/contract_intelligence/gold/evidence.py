@@ -47,6 +47,15 @@ TRUST_REVIEW = "review"
 TRUST_LOW = "low"
 TRUST_UNKNOWN = "unknown"
 
+# source_verified values -- how well the source document backs the value at the
+# OCR/vision layer (Plan 02). ``high`` = DI read the evidence span confidently;
+# ``low`` = DI confidence was poor (or the document scored ``di_quality_flag ==
+# 'low'``); ``confirmed`` = a vision pass re-read the source page and agreed.
+# ``None`` means the signal was not computed.
+SOURCE_HIGH = "high"
+SOURCE_LOW = "low"
+SOURCE_CONFIRMED = "confirmed"
+
 
 # ---------------------------------------------------------------------------
 # Step 2 -- is the quote real?
@@ -201,7 +210,13 @@ def judge_fields(client, model, fields, extractions, text, max_chars):
 # ---------------------------------------------------------------------------
 
 def derive_trust(
-    value, match_type, judge_verdict, judge_error, judge_enabled, validation=None
+    value,
+    match_type,
+    judge_verdict,
+    judge_error,
+    judge_enabled,
+    validation=None,
+    source_verified=None,
 ):
     """Combine the locate result and the judge verdict into a trust category.
 
@@ -223,12 +238,21 @@ def derive_trust(
     structurally ``invalid`` for its type can never be ``high``; it is demoted to
     ``review`` so a human looks before the value is trusted. ``None`` (validation
     disabled) leaves the verdict untouched.
+
+    ``source_verified`` is the Source->DI confidence gate (Plan 02). When the
+    source layer is ``low`` (DI read the evidence span poorly, or the whole
+    document scored ``di_quality_flag == 'low'``) a ``high`` is demoted to
+    ``review`` -- the model may be faithful to garbled text. ``high`` /
+    ``confirmed`` / ``None`` leave the verdict untouched, so a vision pass that
+    *confirms* the page lets a genuine ``high`` stand.
     """
     if value is None:
         return TRUST_UNKNOWN
     trust = _judge_trust(match_type, judge_verdict, judge_error, judge_enabled)
     if validation == vld.INVALID and trust == TRUST_HIGH:
-        return TRUST_REVIEW
+        trust = TRUST_REVIEW
+    if source_verified == SOURCE_LOW and trust == TRUST_HIGH:
+        trust = TRUST_REVIEW
     return trust
 
 

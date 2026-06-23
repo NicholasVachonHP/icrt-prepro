@@ -218,6 +218,75 @@ def _slice_content(content, spans, max_chars):
 
 
 # ---------------------------------------------------------------------------
+# Per-word OCR confidence (DI exposes a confidence per recognised word)
+# ---------------------------------------------------------------------------
+
+# A word is "confident" at or above this score; the document quality signal is
+# the fraction of words that clear it. DI word confidence is a coarse 0..1.
+_HIGH_CONFIDENCE = 0.9
+
+
+def _word_confidences(result):
+    """Flatten DI per-word confidence into ``(start, end, confidence)`` tuples.
+
+    DI ``prebuilt-layout`` reports a confidence per recognised word on
+    ``result.pages[].words[]``; each word's span offsets index into
+    ``result.content`` (the same coordinate space blocks/tables use). Words
+    without a span or confidence are skipped. Returns ``[]`` when the result
+    carries no word-level confidence (e.g. a born-digital PDF DI read losslessly)
+    so callers treat confidence as simply unavailable.
+    """
+    out = []
+    for page in (getattr(result, "pages", None) or []):
+        for w in (getattr(page, "words", None) or []):
+            conf = getattr(w, "confidence", None)
+            if conf is None:
+                continue
+            span = getattr(w, "span", None)
+            if span is None:
+                spans = getattr(w, "spans", None) or []
+                span = spans[0] if spans else None
+            if span is None:
+                continue
+            start = getattr(span, "offset", None)
+            if start is None:
+                continue
+            length = getattr(span, "length", 0) or 0
+            out.append((start, start + length, float(conf)))
+    return out
+
+
+def _span_confidence(word_confs, lo, hi):
+    """Min and mean confidence of the words whose start offset falls in ``[lo, hi)``.
+
+    Returns ``(None, None)`` when no word maps to the span (no confidence data,
+    or a synthetic span such as a rendered markdown table), so the caller stores
+    NULL rather than a misleading number.
+    """
+    if not word_confs or lo is None or hi is None:
+        return None, None
+    vals = [c for (s, _e, c) in word_confs if lo <= s < hi]
+    if not vals:
+        return None, None
+    return min(vals), sum(vals) / len(vals)
+
+
+def document_quality(word_confs, high_threshold=_HIGH_CONFIDENCE):
+    """Fraction of OCR words at/above ``high_threshold`` confidence (0..1).
+
+    A cheap document-level triage signal: 1.0 means every word read cleanly, low
+    values flag a scanned/garbled source whose extracted text should not be
+    trusted without a closer look. Returns ``None`` when no word confidences are
+    available (nothing to score).
+    """
+    if not word_confs:
+        return None
+    high = sum(1 for (_s, _e, c) in word_confs if c >= high_threshold)
+    return high / len(word_confs)
+
+
+
+# ---------------------------------------------------------------------------
 # Table rendering
 # ---------------------------------------------------------------------------
 
@@ -374,17 +443,24 @@ def build_blocks_and_tables(
     min_figure_page_fraction=0.0,
     vision_client=None,
     vision_model=None,
+    word_confs=None,
 ):
     """Decompose a DI AnalyzeResult into ordered blocks + structured tables.
 
     Returns ``(blocks, tables, figures, has_tables, has_figures)`` where ``blocks``
     is a list of dicts (block_index, type, section, page, text, table_id,
-    figure_uri, char_count) in reading order, ``tables`` is a list of dicts ready
-    for the ``contract_tables`` table, and ``figures`` is a list of
-    ``{figure_uri, figure_bytes}`` for the caller to persist. ``figures_by_id``
-    maps DI figure ids to raw bytes (from :func:`fetch_figure_images`); when bytes
-    exist for a figure and ``figure_uri_prefix`` is given, the figure block's
-    ``figure_uri`` becomes ``{prefix}/p{page}_f{idx}.png``.
+    figure_uri, char_count, conf_min, conf_mean) in reading order, ``tables`` is a
+    list of dicts ready for the ``contract_tables`` table, and ``figures`` is a
+    list of ``{figure_uri, figure_bytes}`` for the caller to persist.
+    ``figures_by_id`` maps DI figure ids to raw bytes (from
+    :func:`fetch_figure_images`); when bytes exist for a figure and
+    ``figure_uri_prefix`` is given, the figure block's ``figure_uri`` becomes
+    ``{prefix}/p{page}_f{idx}.png``.
+
+    ``word_confs`` is the per-word confidence index from
+    :func:`_word_confidences`; when supplied, each block records the ``conf_min``
+    and ``conf_mean`` of the DI words covering its span (``None`` when no word
+    maps to it, e.g. a rendered markdown table). Pass ``None`` to skip confidence.
 
     ``min_figure_page_fraction`` drops decorative marks (logos, header/footer
     glyphs) whose bounding box is a smaller fraction of the page than this
@@ -396,6 +472,7 @@ def build_blocks_and_tables(
     covered = _covered_ranges(result)
     figures_by_id = figures_by_id or {}
     figures_out = []
+    word_confs = word_confs or []
 
     # Collect placement entries: (start_offset, kind, payload).
     entries = []
@@ -447,6 +524,8 @@ def build_blocks_and_tables(
             role = getattr(para, "role", None)
             if role in ("title", "sectionHeading"):
                 current_section = text
+            p_lo, p_hi = _span_bounds(getattr(para, "spans", None))
+            c_min, c_mean = _span_confidence(word_confs, p_lo, p_hi)
             blocks.append(
                 {
                     "type": "prose",
@@ -455,6 +534,8 @@ def build_blocks_and_tables(
                     "text": text,
                     "table_id": None,
                     "figure_uri": None,
+                    "conf_min": c_min,
+                    "conf_mean": c_mean,
                 }
             )
         elif kind == "table":
@@ -462,6 +543,8 @@ def build_blocks_and_tables(
             md = table_to_markdown(table)
             if not md:
                 continue
+            t_lo, t_hi = _span_bounds(getattr(table, "spans", None))
+            c_min, c_mean = _span_confidence(word_confs, t_lo, t_hi)
             blocks.append(
                 {
                     "type": "table",
@@ -470,6 +553,8 @@ def build_blocks_and_tables(
                     "text": md,
                     "table_id": table_id,
                     "figure_uri": None,
+                    "conf_min": c_min,
+                    "conf_mean": c_mean,
                 }
             )
         else:  # figure
@@ -501,6 +586,8 @@ def build_blocks_and_tables(
             else:
                 # No rendered image available -> keep the synthetic provenance ref.
                 figure_uri = f"page={page}&figure={f_idx}"
+            f_lo, f_hi = _span_bounds(getattr(figure, "spans", None))
+            c_min, c_mean = _span_confidence(word_confs, f_lo, f_hi)
             blocks.append(
                 {
                     "type": "figure",
@@ -509,6 +596,8 @@ def build_blocks_and_tables(
                     "text": f"[FIGURE p.{page} — {caption}]",
                     "table_id": None,
                     "figure_uri": figure_uri,
+                    "conf_min": c_min,
+                    "conf_mean": c_mean,
                 }
             )
 
@@ -542,6 +631,7 @@ def extract_document(
     min_figure_page_fraction=0.0,
     vision_client=None,
     vision_model=None,
+    persist_confidence=False,
 ):
     """Analyse one document and return its text, blocks, tables, and flags.
 
@@ -551,12 +641,18 @@ def extract_document(
     ``min_figure_page_fraction`` drops decorative marks (logos) below that share
     of the page before captioning/persistence (``0.0`` disables it).
 
+    When ``persist_confidence`` is set, DI per-word confidence is aggregated onto
+    each block (``conf_min`` / ``conf_mean``) and summarised into a document-level
+    ``di_quality`` (fraction of words read at high confidence); otherwise those
+    are ``None``.
+
     Returns a dict:
         {
           "text": str,            # DI's full result.content markdown (extracted_text)
           "page_count": int,
           "has_tables": bool,
           "has_figures": bool,
+          "di_quality": float|None,  # fraction of words >= high confidence
           "blocks": list[dict],   # ordered semantic blocks (filtered, for chunking)
           "tables": list[dict],   # structured tables
           "figures": list[dict],  # {figure_uri, figure_bytes} for caller to save
@@ -572,6 +668,10 @@ def extract_document(
     if want_figures and (getattr(result, "figures", None) or []):
         figures_by_id = fetch_figure_images(di_client, result, operation_id)
 
+    # Per-word OCR confidence index (offsets into result.content), computed once
+    # and shared by the block aggregation and the document-quality score.
+    word_confs = _word_confidences(result) if persist_confidence else []
+
     blocks, tables, figures, has_tables, has_figures = build_blocks_and_tables(
         result,
         max_caption_chars=max_caption_chars,
@@ -580,6 +680,7 @@ def extract_document(
         min_figure_page_fraction=min_figure_page_fraction,
         vision_client=(vision_client if caption_figures else None),
         vision_model=vision_model,
+        word_confs=word_confs,
     )
     # Gold reads the *complete* document: use DI's faithful markdown content
     # (every clause, tables inline, image OCR retained). Only fall back to the
@@ -588,12 +689,14 @@ def extract_document(
     if not text:
         text = blocks_to_text(blocks)
     pages = getattr(result, "pages", None) or []
+    di_quality = document_quality(word_confs) if persist_confidence else None
 
     return {
         "text": text,
         "page_count": len(pages),
         "has_tables": has_tables,
         "has_figures": has_figures,
+        "di_quality": di_quality,
         "blocks": blocks,
         "tables": tables,
         "figures": figures,
