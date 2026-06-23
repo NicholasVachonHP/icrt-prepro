@@ -1,6 +1,15 @@
 # Plan 01 — Typed extraction quality
 
-**Status:** Proposed · **Date:** 2026-06-22 · **Scope:** gold stage + config (no silver schema change)
+**Status:** Implemented · **Date:** 2026-06-22 · **Scope:** gold stage + config (no silver schema change)
+
+> **Implemented 2026-06-23.** All four phases shipped. New modules
+> `gold/strategy.py`, `gold/retrieval.py`, `gold/validate.py`,
+> `gold/scheduler.py`; `contract_field_evidence` gained `extraction_strategy`,
+> `retrieved_chunk_ids`, and `type_validation` columns; gold config gained
+> `structured_output`, `type_validation_enabled`, `retrieval_top_k`,
+> `retrieval_min_chunks`, and `token_budget`. The validation column/toggle ship
+> as `type_validation` / `type_validation_enabled` (the §6/§8 `validation` name
+> was renamed for clarity).
 
 ## 1. Goal
 
