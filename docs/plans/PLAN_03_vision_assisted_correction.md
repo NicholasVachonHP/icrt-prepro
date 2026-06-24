@@ -226,17 +226,23 @@ clean contracts make one. Throttled by the existing `token_budget` scheduler.
 Plan 03's provenance (`original_value`, `value_source`, `vision_action`,
 `vision_verdict`) is deliberately the **feedstock** for what comes next:
 
-- **PLAN_04 — Feedback & calibration loop.** Capture human review decisions
+- **PLAN_04 — Append-only audit trail.** Record each pipeline step
+  (extract → judge → vision_verify → vision_correct → rejudge) as an immutable row
+  in `contract_field_audit`, so the *initial* judge/verify verdicts and rationales
+  that Plan 03 overwrites are preserved. Keeps `contract_field_evidence` as the
+  slim final projection; the audit table is joined only when drilling in. *(See
+  [PLAN_04_audit_trail.md](PLAN_04_audit_trail.md).)*
+- **PLAN_05 — Feedback & calibration loop.** Capture human review decisions
   (accept / override / correct) in a `contract_field_review` table; join with
   `gold_eval_results` to *measure* per-tier trust precision/recall and *tune*
   thresholds (`fuzzy_threshold`, `evidence_di_confidence_threshold`,
   `di_quality_threshold`) from data instead of by hand — enabling safe
   auto-accept of `high`. Corrected-value acceptances are direct labels for "was
   the vision correction right?".
-- **PLAN_05 — Self-consistency confidence.** Sample each (high-value) field K
+- **PLAN_06 — Self-consistency confidence.** Sample each (high-value) field K
   times (temperature or retrieval perturbation); use agreement as a *graded*
   `consistency_score` that complements categorical trust and flags unstable
   fields. Applied selectively under the existing `token_budget` scheduler.
 
-These two close the remaining state-of-the-art gaps (calibrated + graded
+These close the remaining state-of-the-art gaps (auditable + calibrated + graded
 confidence); Plan 03 completes the extraction-fidelity ladder they build on.
