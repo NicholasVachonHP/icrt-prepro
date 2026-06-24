@@ -69,10 +69,14 @@
     "retrieval_min_chunks": 3,
     "_confidence_gate_note": "Plan 02 Source->DI confidence gate. Each field's evidence quote is located within the silver blocks to read the DI conf_min of its span (evidence_di_confidence) and source page (evidence_page). A span below evidence_di_confidence_threshold, or a document scored di_quality_flag=low, sets source_verified=low which can never be 'high' trust (demoted to review). Feeds the gold code_hash, so changing it re-derives trust for all contracts.",
     "evidence_di_confidence_threshold": 0.7,
-    "_vision_verify_note": "Plan 02 Phase 2 targeted vision verification. When vision_verify_enabled and the bronze source files are reachable, escalated fields (fuzzy/not_found match, review/low trust, low DI confidence, or low di_quality) have their source PDF page rendered to an image and re-read by a multimodal model (vision_verify_model, defaults to MAIN_MODEL) to confirm/contradict the value. A confirmed page can restore 'high'; a contradiction sets source_verified=low so the field can never be 'high' (demoted to review). vision_verify_max_chars caps the value text shown to the model. Best-effort: a no-op when disabled, source files absent, or rendering unavailable. Feeds the gold code_hash.",
-    "vision_verify_enabled": true,
-    "vision_verify_model": null,
-    "vision_verify_max_chars": 4000,
+    "_vision_note": "Plan 02->03 targeted vision verification & correction. gold.vision.mode is an escalating, mutually-exclusive enum: off (no vision); verify (Plan 02 \u2014 re-read the source PDF page to confirm/contradict an EXISTING value, folding into source_verified: a confirmed page can restore 'high', a contradiction demotes to review; never changes the value); correct (Plan 03 \u2014 when verify can't confirm, re-read the value straight off the page image, re-locate + re-judge it, and re-derive trust; the only path a base-'review' field can reach 'high'. A corrected value is tagged value_source=vision, original_value records the pre-correction value, and an image-backed quote becomes match_type=vision_page when the re-judge agrees). Escalated fields = fuzzy/not_found quote, review/low trust, low DI confidence, or low di_quality. model defaults to the silver DI vision_model then MAIN_MODEL. max_chars caps the value text shown to the model; correct_max_fields caps corrections per contract; page_scan_limit bounds page renders when no anchor exists (retrieval supplies the page first). Requires the bronze source files reachable AND PyMuPDF (pip install pymupdf) to render pages \u2014 best-effort no-op otherwise. All gold.vision.* keys feed the gold code_hash, so changing them re-derives trust over all contracts. Set to 'correct' after validating Plan 03 in dev.",
+    "vision": {
+      "mode": "verify",
+      "model": null,
+      "max_chars": 4000,
+      "correct_max_fields": 4,
+      "page_scan_limit": 3
+    },
     "_token_budget_note": "Caps the summed in-flight token cost across the global gold work queue (gold/scheduler.py), which fans every model call from every contract (extraction -> reduce -> judge) into one pool throttled by tokens, not a fixed thread count. Set below the gpt-4.1 deployment's per-minute token ceiling (750K TPM); 500K leaves headroom for SDK 429 retries. Pure runtime knob \u2014 NOT part of the code fingerprint, so tuning it never forces reprocessing. Replaces the now-ignored max_concurrency.",
     "token_budget": 500000
   },

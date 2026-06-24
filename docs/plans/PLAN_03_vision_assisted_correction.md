@@ -1,6 +1,6 @@
 # Plan 03 — Vision-assisted correction & re-judge for review fields
 
-**Status:** Proposed · **Date:** 2026-06-23 · **Scope:** gold trust loop + `gold/vision.py` (rename) + config consolidation
+**Status:** Implemented · **Date:** 2026-06-23 · **Scope:** gold trust loop + `gold/vision.py` (rename) + config consolidation
 
 ## 1. Goal
 

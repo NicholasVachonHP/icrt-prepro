@@ -56,7 +56,7 @@ from . import retrieval
 from . import scheduler
 from . import strategy as strat
 from . import validate as vld
-from . import vision_verify
+from . import vision
 from ..common.ai_clients import get_openai_client
 from ..common.versioning import code_fingerprint
 from ..common.scd2 import (
@@ -116,6 +116,9 @@ _EVIDENCE_META = [
     StructField("source_verified", StringType(), True),  # high/low/confirmed (Source->DI gate)
     StructField("vision_verdict", StringType(), True),   # confirmed/contradicted/unclear (Phase 2)
     StructField("vision_rationale", StringType(), True), # one-line vision justification
+    StructField("vision_action", StringType(), True),    # none/verify/correct (Plan 03)
+    StructField("value_source", StringType(), True),     # model_text/vision (Plan 03)
+    StructField("original_value", StringType(), True),   # pre-correction value (Plan 03 calibration hook)
     StructField("trust", StringType(), False),           # high/review/low/unknown
     StructField("contract_truncated", BooleanType(), False),
     StructField("model", StringType(), True),
@@ -650,6 +653,9 @@ def _finalize_contract(
                 "source_verified": source_verified,
                 "vision_verdict": None,
                 "vision_rationale": None,
+                "vision_action": "none",
+                "value_source": "model_text",
+                "original_value": None,
                 "trust": trust,
                 "contract_truncated": truncated,
             }
@@ -1028,6 +1034,224 @@ def _block_confidence_for_quote(quote, blocks):
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 vision stage (Plan 02 verify / Plan 03 correct)
+# ---------------------------------------------------------------------------
+
+# Most-uncertain-first ranks used to order (and cap) the per-contract correction
+# set in correct mode (Plan 03 §4.1).
+_TRUST_UNCERTAINTY = {
+    ev.TRUST_LOW: 0,
+    ev.TRUST_REVIEW: 1,
+    ev.TRUST_UNKNOWN: 2,
+    ev.TRUST_HIGH: 3,
+}
+_MATCH_UNCERTAINTY = {
+    ev.MATCH_NOT_FOUND: 0,
+    ev.MATCH_FUZZY: 1,
+    ev.MATCH_NA_NULL: 2,
+    ev.MATCH_NORMALIZED: 3,
+    ev.MATCH_EXACT: 4,
+    ev.MATCH_VISION_PAGE: 3,
+}
+
+
+def _vision_escalates(fr, di_quality_flag, di_conf_threshold):
+    """The escalation gate: is this field uncertain enough to re-read its source
+    page? A fuzzy / not-found quote, a ``review`` / ``low`` trust, a
+    low-confidence DI evidence span, or a poorly-scanned document all qualify
+    (Plan 02 §4.1, reused by Plan 03)."""
+    conf = fr["evidence_di_confidence"]
+    return (
+        fr["match_type"] in (ev.MATCH_FUZZY, ev.MATCH_NOT_FOUND)
+        or fr["trust"] in (ev.TRUST_REVIEW, ev.TRUST_LOW)
+        or (conf is not None and conf < di_conf_threshold)
+        or di_quality_flag == "low"
+    )
+
+
+def _vision_uncertainty_key(fr):
+    """Sort key (most-uncertain first) for capping corrections per contract."""
+    conf = fr["evidence_di_confidence"]
+    return (
+        _TRUST_UNCERTAINTY.get(fr["trust"], 1),
+        _MATCH_UNCERTAINTY.get(fr["match_type"], 2),
+        conf if conf is not None else 1.0,
+    )
+
+
+def _render_first_page(file_path, pages, cache):
+    """Render the first of ``pages`` that yields an image (best-effort), caching
+    per ``(file_path, page)``. Returns ``(png_bytes, page_number)`` or
+    ``(None, None)`` when none render."""
+    for page in pages:
+        key = (file_path, page)
+        if key not in cache:
+            cache[key] = vision.render_page_png(file_path, page)
+        png = cache[key]
+        if png:
+            return png, page
+    return None, None
+
+
+def _run_vision_stage(
+    client, search_client, fields, pending_rows, results, *,
+    bronze_files_dir, mode, vision_model, vision_max_chars, correct_max_fields,
+    page_scan_limit, di_conf_threshold, judge_enabled, judge_model, max_chars,
+    fuzzy_threshold, evidence_max_chars, retrieval_top_k,
+):
+    """Re-read source pages for escalated fields (verify / correct), in place.
+
+    Per contract: select the escalated fields; resolve each one's source page(s)
+    (known evidence page -> retrieval page -> bounded scan); render the first that
+    succeeds; run vision *verify* against the existing value. In ``correct`` mode,
+    when verify can't confirm, ``correct_field`` re-reads the value straight off
+    the page, the new value is re-located in silver text (or marked
+    ``vision_page`` when the re-judge agrees, §9.1), and all corrected fields of
+    the contract are re-judged in a single batched judge call before trust is
+    re-derived. Mutates the field rows inside ``results``; returns nothing."""
+    field_defs = {f["field_name"]: f for f in fields}
+    questions = {f["field_name"]: f.get("question", f["field_name"]) for f in fields}
+    page_cache = {}      # (file_path, page) -> png bytes | None
+    verified_n = corrected_n = 0
+
+    for r, (_v, error, _t, field_rows) in zip(pending_rows, results):
+        if error or not field_rows:
+            continue
+        rel = r["relative_path"]
+        text = r["extracted_text"]
+        di_quality_flag = r.asDict().get("di_quality_flag")
+        file_path = f"{bronze_files_dir}/{rel}"
+
+        candidates = [
+            fr for fr in field_rows
+            if _vision_escalates(fr, di_quality_flag, di_conf_threshold)
+        ]
+        # The correction set is bounded per contract (Plan 03 §4.1); verify mode
+        # keeps Plan 02 behaviour (every escalated field, no cap).
+        if mode == vision.MODE_CORRECT and correct_max_fields >= 0:
+            candidates = sorted(candidates, key=_vision_uncertainty_key)[
+                :correct_max_fields
+            ]
+
+        corrected = []   # field rows whose value vision replaced (need re-judge)
+        for fr in candidates:
+            has_value = fr["value"] is not None
+            # verify needs an existing value to confirm; only correct can fill in
+            # a missing one.
+            if not has_value and mode != vision.MODE_CORRECT:
+                continue
+            question = questions.get(fr["field_name"], fr["field_name"])
+
+            # Page selection: known evidence page, else the pages carried by the
+            # field's top retrieved chunks, else a bounded scan.
+            retrieval_pages = []
+            if fr["evidence_page"] is None and search_client is not None:
+                retrieval_pages = [
+                    c.get("page")
+                    for c in retrieval.retrieve_chunks(
+                        search_client, question, rel, retrieval_top_k
+                    )
+                ]
+            pages = vision.resolve_pages(
+                fr["evidence_page"], retrieval_pages, page_scan_limit
+            )
+            png, used_page = _render_first_page(file_path, pages, page_cache)
+            if png is None:
+                continue
+
+            # ---- verify (both modes; skipped for a still-missing value) ----
+            verdict = vision.VERDICT_UNCLEAR
+            if has_value:
+                verdict, rationale = vision.verify_field(
+                    client, vision_model, png, question, fr["value"],
+                    max_chars=vision_max_chars,
+                )
+                fr["vision_verdict"] = verdict
+                fr["vision_rationale"] = rationale
+                fr["vision_action"] = vision.MODE_VERIFY
+                fr["source_verified"] = vision.verdict_to_source_verified(
+                    verdict, fr["source_verified"]
+                )
+                fr["trust"] = ev.derive_trust(
+                    fr["value"], fr["match_type"], fr["judge_verdict"],
+                    fr["judge_error"], judge_enabled, fr["type_validation"],
+                    fr["source_verified"],
+                )
+                verified_n += 1
+
+            # ---- correct (Plan 03; only when verify can't confirm) ----
+            if mode == vision.MODE_CORRECT and verdict != vision.VERDICT_CONFIRMED:
+                corr = vision.correct_field(
+                    client, vision_model, png, question, used_page,
+                    max_chars=vision_max_chars,
+                )
+                if corr and corr["verdict"] == vision.CORRECTION_OK and corr["value"]:
+                    fr["original_value"] = fr["value"]
+                    fr["value"] = corr["value"]
+                    fr["value_source"] = "vision"
+                    fr["vision_action"] = vision.MODE_CORRECT
+                    if corr["rationale"]:
+                        fr["vision_rationale"] = corr["rationale"]
+                    fr["evidence_page"] = used_page
+                    new_quote = corr["evidence"]
+                    # Re-locate the corrected value's quote in silver text. When
+                    # it isn't there (the premise is that DI text was wrong) it is
+                    # a provisional not_found, upgraded to vision_page only if the
+                    # re-judge confirms the value (Plan 03 §9.1 guardrail).
+                    fr["match_type"] = (
+                        ev.locate_evidence(new_quote, text, fuzzy_threshold)
+                        if new_quote else ev.MATCH_NOT_FOUND
+                    )
+                    if new_quote and evidence_max_chars and len(new_quote) > evidence_max_chars:
+                        new_quote = new_quote[:evidence_max_chars]
+                    fr["evidence_text"] = new_quote
+                    fr["source_verified"] = ev.SOURCE_CONFIRMED
+                    corrected.append(fr)
+
+        # ---- re-judge corrected fields (one batched call) + re-derive trust ----
+        if corrected:
+            rejudge = {}
+            if judge_enabled:
+                cfields = [field_defs[fr["field_name"]] for fr in corrected]
+                extractions = {
+                    fr["field_name"]: {
+                        "value": fr["value"], "evidence": fr["evidence_text"]
+                    }
+                    for fr in corrected
+                }
+                try:
+                    rejudge = ev.judge_fields(
+                        client, judge_model, cfields, extractions, text, max_chars
+                    )
+                except Exception:  # noqa: BLE001 - non-fatal; keep prior signals
+                    rejudge = {}
+            for fr in corrected:
+                v = rejudge.get(fr["field_name"], {})
+                if v.get("verdict") is not None:
+                    fr["judge_verdict"] = v.get("verdict")
+                    fr["judge_rationale"] = v.get("rationale")
+                # Page-as-evidence: an unlocatable corrected quote counts as
+                # located only when the re-judge confirms the value (§9.1).
+                if (
+                    fr["match_type"] == ev.MATCH_NOT_FOUND
+                    and fr["judge_verdict"] == ev.VERDICT_CORRECT
+                ):
+                    fr["match_type"] = ev.MATCH_VISION_PAGE
+                fr["trust"] = ev.derive_trust(
+                    fr["value"], fr["match_type"], fr["judge_verdict"],
+                    fr["judge_error"], judge_enabled, fr["type_validation"],
+                    fr["source_verified"],
+                )
+                corrected_n += 1
+
+    if verified_n or corrected_n:
+        print(
+            f"[gold] vision stage ({mode}): verified {verified_n}, "
+            f"corrected {corrected_n} field(s)."
+        )
+
+
 def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=None,
         bronze_files_dir=None):
     """Extract structured comparison fields from silver text into the gold table.
@@ -1042,10 +1266,11 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
             "ALL") to force-reprocess even when unchanged; falls back to the
             ``reprocess.force_paths`` config key.
         bronze_files_dir: Optional path to the bronze ``Files`` area holding the
-            original source documents. Required only for Phase 2 vision
-            verification (Plan 02): escalated fields render their source page from
-            ``{bronze_files_dir}/{relative_path}``. When ``None`` (or vision is
-            disabled) vision verification is a clean no-op.
+            original source documents. Required only for the Phase 2 vision stage
+            (Plan 02 verify / Plan 03 correct): escalated fields render their
+            source page from ``{bronze_files_dir}/{relative_path}``. When ``None``
+            (or ``gold.vision.mode`` is ``off``) the vision stage is a clean
+            no-op.
     """
     cfg = config or {}
     gold_cfg = cfg.get("gold", {})
@@ -1097,20 +1322,32 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
     evidence_di_confidence_threshold = float(
         gold_cfg.get("evidence_di_confidence_threshold", 0.7)
     )
-    # Phase 2 targeted vision verification (Plan 02). When enabled and the bronze
-    # source files are reachable (bronze_files_dir), escalated fields have their
-    # source page re-read by a multimodal model. vision_verify_model defaults to
-    # the main (vision-capable) model. All three feed the code fingerprint so
-    # toggling them re-derives trust over existing contracts.
-    vision_verify_enabled = bool(gold_cfg.get("vision_verify_enabled", False))
-    vision_verify_max_chars = int(gold_cfg.get("vision_verify_max_chars", 4000))
+    # Targeted vision verification & correction (Plan 02 -> Plan 03). The nested
+    # gold.vision block drives an escalating, mutually-exclusive mode:
+    #   off     -> no vision (clean no-op).
+    #   verify  -> Plan 02: re-read the source page to confirm/contradict an
+    #              existing value (folds into source_verified; never changes it).
+    #   correct -> Plan 03: when verify can't confirm, re-read the value straight
+    #              off the page image, re-locate + re-judge it, and re-derive
+    #              trust -- the only path a base-'review' field can reach 'high'.
+    # When mode != off and the bronze source files are reachable (bronze_files_dir)
+    # the stage runs; otherwise it is a clean no-op. All gold.vision.* keys feed
+    # the code fingerprint, so changing them re-derives trust over existing
+    # contracts.
+    vision_cfg = gold_cfg.get("vision", {}) or {}
+    vision_mode = (vision_cfg.get("mode") or vision.MODE_OFF).strip().lower()
+    if vision_mode not in vision._MODES:
+        vision_mode = vision.MODE_OFF
+    vision_max_chars = int(vision_cfg.get("max_chars", 4000))
+    vision_correct_max_fields = int(vision_cfg.get("correct_max_fields", 4))
+    vision_page_scan_limit = int(vision_cfg.get("page_scan_limit", 3))
     model = os.environ.get("MAIN_MODEL") or cfg.get("azure_openai", {}).get(
         "completion_model", "gpt-4.1"
     )
-    # Vision verification model: explicit config override, else the silver DI
-    # vision model, else the main (vision-capable) model.
-    vision_verify_model = (
-        gold_cfg.get("vision_verify_model")
+    # Vision model: explicit config override, else the silver DI vision model,
+    # else the main (vision-capable) model.
+    vision_model = (
+        vision_cfg.get("model")
         or cfg.get("silver", {}).get("document_intelligence", {}).get("vision_model")
         or model
     )
@@ -1134,7 +1371,7 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
     # the model, the input cap, or the evidence/judge knobs.
     current_code = code_fingerprint(
         [__file__, ev.__file__, strat.__file__, vld.__file__, retrieval.__file__,
-         scheduler.__file__, vision_verify.__file__],
+         scheduler.__file__, vision.__file__],
         {
             "system_prompt": _SYSTEM_PROMPT,
             "judge_system_prompt": ev.JUDGE_SYSTEM_PROMPT,
@@ -1146,9 +1383,11 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
             "retrieval_top_k": retrieval_top_k,
             "retrieval_min_chunks": retrieval_min_chunks,
             "evidence_di_confidence_threshold": evidence_di_confidence_threshold,
-            "vision_verify_enabled": vision_verify_enabled,
-            "vision_verify_model": vision_verify_model,
-            "vision_verify_max_chars": vision_verify_max_chars,
+            "vision_mode": vision_mode,
+            "vision_model": vision_model,
+            "vision_max_chars": vision_max_chars,
+            "vision_correct_max_fields": vision_correct_max_fields,
+            "vision_page_scan_limit": vision_page_scan_limit,
             "strategies": strategies,
             "fields": fields,
             "model": model,
@@ -1276,62 +1515,32 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
             di_conf_threshold=evidence_di_confidence_threshold,
         )
 
-        # ---- Phase 2: targeted vision verification (Plan 02) ----
-        # Re-read the original source page with a multimodal model for the small
-        # subset of escalated fields, fold the verdict into source_verified and
-        # re-derive trust. A clean no-op unless enabled, the bronze source files
-        # are reachable, and a field has a page anchor to render.
-        if vision_verify_enabled and bronze_files_dir:
-            questions = {
-                f["field_name"]: f.get("question", f["field_name"]) for f in fields
-            }
-            page_cache = {}   # (relative_path, page) -> png bytes | None
-            verified_n = 0
-            for r, (_v, error, _t, field_rows) in zip(pending_rows, results):
-                if error or not field_rows:
-                    continue
-                rel = r["relative_path"]
-                di_quality_flag = r.asDict().get("di_quality_flag")
-                file_path = f"{bronze_files_dir}/{rel}"
-                for fr in field_rows:
-                    if fr["value"] is None:
-                        continue            # nothing to verify
-                    page = fr["evidence_page"]
-                    if page is None:
-                        continue            # no page anchor to render
-                    conf = fr["evidence_di_confidence"]
-                    escalate = (
-                        fr["match_type"] in (ev.MATCH_FUZZY, ev.MATCH_NOT_FOUND)
-                        or fr["trust"] in (ev.TRUST_REVIEW, ev.TRUST_LOW)
-                        or (conf is not None and conf < evidence_di_confidence_threshold)
-                        or di_quality_flag == "low"
-                    )
-                    if not escalate:
-                        continue
-                    key = (rel, page)
-                    if key not in page_cache:
-                        page_cache[key] = vision_verify.render_page_png(file_path, page)
-                    png = page_cache[key]
-                    if not png:
-                        continue
-                    verdict, rationale = vision_verify.verify_field(
-                        client, vision_verify_model, png,
-                        questions.get(fr["field_name"], fr["field_name"]),
-                        fr["value"], max_chars=vision_verify_max_chars,
-                    )
-                    fr["vision_verdict"] = verdict
-                    fr["vision_rationale"] = rationale
-                    fr["source_verified"] = vision_verify.verdict_to_source_verified(
-                        verdict, fr["source_verified"]
-                    )
-                    fr["trust"] = ev.derive_trust(
-                        fr["value"], fr["match_type"], fr["judge_verdict"],
-                        fr["judge_error"], judge_enabled, fr["type_validation"],
-                        fr["source_verified"],
-                    )
-                    verified_n += 1
-            if verified_n:
-                print(f"[gold] vision verification escalated {verified_n} field(s).")
+        # ---- Phase 2: vision verification & correction (Plan 02 -> Plan 03) ----
+        # Re-read source pages for the small escalated subset of fields. ``verify``
+        # confirms or contradicts an existing value (folds into source_verified);
+        # ``correct`` (Plan 03) re-reads a wrong/missing value straight off the
+        # page image when verify can't confirm, re-locates + re-judges it, and
+        # re-derives trust. A clean no-op when mode is off or the bronze source
+        # files are unreachable. In correct mode a search client is ensured (even
+        # when no RAG group needs one) so unlocated fields get retrieval-first
+        # page selection rather than only a bounded page scan.
+        if vision_mode != vision.MODE_OFF and bronze_files_dir:
+            vision_search_client = search_client or (
+                retrieval.get_search_client(cfg)
+                if vision_mode == vision.MODE_CORRECT else None
+            )
+            _run_vision_stage(
+                client, vision_search_client, fields, pending_rows, results,
+                bronze_files_dir=bronze_files_dir, mode=vision_mode,
+                vision_model=vision_model, vision_max_chars=vision_max_chars,
+                correct_max_fields=vision_correct_max_fields,
+                page_scan_limit=vision_page_scan_limit,
+                di_conf_threshold=evidence_di_confidence_threshold,
+                judge_enabled=judge_enabled, judge_model=judge_model,
+                max_chars=max_chars, fuzzy_threshold=fuzzy_threshold,
+                evidence_max_chars=evidence_max_chars,
+                retrieval_top_k=retrieval_top_k,
+            )
 
         for r, (values, error, _truncated, field_rows) in zip(pending_rows, results):
             if error:
@@ -1380,6 +1589,9 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
                         source_verified=fr["source_verified"],
                         vision_verdict=fr["vision_verdict"],
                         vision_rationale=fr["vision_rationale"],
+                        vision_action=fr["vision_action"],
+                        value_source=fr["value_source"],
+                        original_value=fr["original_value"],
                         trust=fr["trust"],
                         contract_truncated=fr["contract_truncated"],
                         model=model,

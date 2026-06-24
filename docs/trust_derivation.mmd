@@ -1,8 +1,10 @@
 %% Gold per-field trust derivation (contract_field_evidence.trust)
-%% Logic source: src/contract_intelligence/gold/evidence.py
+%% Logic source: src/contract_intelligence/gold/evidence.py + gold/fields.py
 %%   derive_trust()  = base trust (Step A) then two downgrade gates (Step B)
 %%   _judge_trust()  = Step A
-%% Plan 01 added the type_validation gate; Plan 02 added the source_verified gate.
+%% Plan 01 added the type_validation gate; Plan 02 added the source_verified gate
+%% and the vision VERIFY rung; Plan 03 added the vision CORRECT rung, which can
+%% rewrite the value and re-enter derive_trust (the dashed loop, bottom).
 flowchart TD
     START([Field value + evidence quote]) --> V{value is null?}
     V -->|yes| UNK[[unknown]]
@@ -12,7 +14,7 @@ flowchart TD
         direction TB
         ERR{judge errored?} -->|yes| R1[review]
         ERR -->|no| JEN{judge enabled<br/>AND verdict present?}
-        JEN -->|no| L1{quote located?<br/>exact / normalized / fuzzy}
+        JEN -->|no| L1{quote located?<br/>exact / normalized /<br/>fuzzy / vision_page}
         L1 -->|yes| R2[review]
         L1 -->|no| U1[unknown]
         JEN -->|yes| VER{judge_verdict}
@@ -59,11 +61,39 @@ flowchart TD
     SVH ==>|feeds| G2
     SVC ==>|feeds| G2
 
+    %% --- Phase 2 vision stage: escalated fields re-read the source page ---
+    %% (gold/fields.py::_run_vision_stage). VERIFY only nudges source_verified
+    %% above; CORRECT (Plan 03) can replace the value and loop back into Step A.
+    subgraph vstage["Phase 2 vision stage (escalated fields only)"]
+        direction TB
+        ESC{escalates?<br/>fuzzy/not_found · review/low trust<br/>· low DI conf · low di_quality} -->|no| SKIP[leave field as-is]
+        ESC -->|yes| RENDER[render source page → image]
+        RENDER --> VV{vision VERIFY<br/>confirms value?}
+        VV -->|yes| VOK[source_verified = confirmed]
+        VV -->|no, mode=verify| VNO[source_verified<br/>unchanged / low]
+        VV -->|no, mode=correct| CORR[vision CORRECT:<br/>read value off page]
+        CORR --> CV{returned a value?}
+        CV -->|no| VNO
+        CV -->|yes| NEWVAL[value := corrected<br/>value_source = vision<br/>original_value kept<br/>source_verified = confirmed]
+        NEWVAL --> RELOC[re-locate quote<br/>in silver text]
+        RELOC --> RJ[re-judge corrected fields<br/>one batched call]
+        RJ --> VPG{re-judge == correct<br/>AND quote not_found?}
+        VPG -->|yes| VPMATCH[match_type = vision_page]
+        VPG -->|no| KEEP[keep located /<br/>not_found match]
+    end
+    VOK -.->|sets| SVC
+    NEWVAL -.->|sets| SVC
+    %% corrected fields re-enter derive_trust with the new value/match/verdict
+    VPMATCH -.->|re-derive trust| START
+    KEEP -.->|re-derive trust| START
+
     classDef high fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20;
     classDef review fill:#ffe0b2,stroke:#ef6c00,color:#e65100;
     classDef low fill:#ffcdd2,stroke:#c62828,color:#b71c1c;
     classDef unknown fill:#e0e0e0,stroke:#616161,color:#212121;
+    classDef vis fill:#e1f5fe,stroke:#0277bd,color:#01579b;
     class HFINAL,HIGH,SVH,SVC high;
     class RFINAL,R1,R2,R3,R4,RG review;
     class LFINAL,LOW,SVL,SVL2 low;
     class UNK,U1,U2 unknown;
+    class ESC,SKIP,RENDER,VV,VOK,VNO,CORR,CV,NEWVAL,RELOC,RJ,VPG,VPMATCH,KEEP vis;

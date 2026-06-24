@@ -30,10 +30,14 @@ from . import validate as vld
 MATCH_EXACT = "exact"
 MATCH_NORMALIZED = "normalized"
 MATCH_FUZZY = "fuzzy"
+MATCH_VISION_PAGE = "vision_page"   # image-backed corrected value (Plan 03)
 MATCH_NOT_FOUND = "not_found"
 MATCH_NA_NULL = "na_null"          # value is null -> no quote expected
 
-_LOCATED = (MATCH_EXACT, MATCH_NORMALIZED, MATCH_FUZZY)
+# Located = the cited evidence is genuinely backed: found in silver text
+# (exact/normalized/fuzzy) OR read straight off the source page image by a vision
+# correction (vision_page, Plan 03 §9.1 -- assigned only when the re-judge agrees).
+_LOCATED = (MATCH_EXACT, MATCH_NORMALIZED, MATCH_FUZZY, MATCH_VISION_PAGE)
 
 # judge_verdict values.
 VERDICT_CORRECT = "correct"
