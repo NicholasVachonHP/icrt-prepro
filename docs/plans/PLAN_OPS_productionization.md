@@ -2,7 +2,8 @@
 
 **Status:** Proposed · **Date:** 2026-06-29 · **Scope:** operational/infra track —
 3 mirrored workspaces, code as a Python package, Variable Library config, Key
-Vault secrets, Fabric deployment pipeline. Solo developer.
+Vault secrets, Fabric deployment pipeline, and the serving tier (DAB on ACA →
+Foundry agent). Solo developer.
 
 > **Track note.** This is an *operational* plan, parallel to the analytical
 > roadmap. It does **not** consume the PLAN_05 (calibration) or PLAN_06
@@ -44,12 +45,12 @@ repeatable promotion path, sized for a **single developer**:
 ```
         Azure DevOps                          Fabric
   ┌────────────────────┐          ┌──────────────────────────────┐
-  │ repo: fabric-items │──Git────▶│ dev workspace                │
-  │ (notebooks, pl,    │          │  notebooks · ictr_pl · env   │──┐
-  │  environments)     │          │  lakehouses(bronze/silver/   │  │ deployment
+  │ ictr monorepo:     │──Git────▶│ dev workspace                │
+  │  fabric/ (nb, pl,  │          │  notebooks · ictr_pl · env   │──┐
+  │   env, var lib)    │          │  lakehouses(bronze/silver/   │  │ deployment
   ├────────────────────┤          │   gold) · Variable Library   │  │ pipeline
-  │ repo: contract-    │  build   │  (value set: dev)            │  │ (promote
-  │ intelligence (pkg) │──wheel──▶│  Environment ← .whl          │  │  defs only)
+  │  core/ (library)   │  build   │  (value set: dev)            │  │ (promote
+  │  dab/ (→ §9)        │──wheel──▶│  Environment ← .whl          │  │  defs only)
   └────────────────────┘          ├──────────────────────────────┤  ▼
                                   │ demo workspace (value set:   │ ...
   ┌────────────────────┐          │  demo, ~25 contracts)        │
@@ -58,10 +59,12 @@ repeatable promotion path, sized for a **single developer**:
   └────────────────────┘          └──────────────────────────────┘
 ```
 
-**One source of truth:** code = the wheel (in its own repo); item definitions =
-Fabric Git; per-env values = Variable Library. Each workspace's lakehouses hold
-*its own data* (separate SharePoint folder per env) — data is never promoted,
-only item definitions.
+**One source of truth:** one `ictr` monorepo — `core/` builds the wheel, `fabric/`
+is Git-synced to the dev workspace, `dab/` builds the serving container; per-env
+values = Variable Library. Each workspace's lakehouses hold *its own data*
+(separate SharePoint folder per env) — data is never promoted, only item
+definitions. The serving tier (DAB + Foundry agent) is a **separate lifecycle**
+that binds to a stage by config (§9).
 
 ## 4. Decisions (resolved)
 
@@ -76,10 +79,16 @@ only item definitions.
 3. **Config:** per-env differences in a **Fabric Variable Library** (one *value
    set* per stage); static defaults live in the package. Selection is automatic
    by stage — no rebuild to tweak prod.
-4. **Secrets:** **Azure DevOps** repos (package repo separate from the
-   Fabric-items repo). **2 Key Vaults** — one nonprod (dev+demo), one prod —
-   public endpoint + RBAC, read via `notebookutils.credentials.getSecret`. No
-   VNet/private endpoint.
+4. **Secrets & repos:** one **Azure DevOps monorepo** `ictr` with folders
+   `fabric/` (Git-synced to the workspace), `core/` (builds the wheel), `dab/`
+   (builds the serving container). **2 Key Vaults** — one nonprod (dev+demo), one
+   prod — public endpoint + RBAC, read via `notebookutils.credentials.getSecret`.
+   No VNet/private endpoint.
+5. **Serving tier is decoupled.** **DAB** runs on **Azure Container Apps**
+   (read-only, MCP) over each stage's gold SQL endpoint; the **Foundry
+   `ictr-agent`** (prompt agent) consumes it plus the **AI Search** index. Both
+   deploy on their **own** lifecycle and bind to a stage purely by config — *not*
+   via the Fabric deployment pipeline (§9).
 
 ## 5. Step 1 — Package the code (your first wheel)
 
@@ -235,21 +244,91 @@ Key Vault reads. The `TODO (security)` in `config.py` already names the mechanis
 6. **Then → prod:** same, with the prod SharePoint folder (~1000). Re-check cost
    knobs (`vision.mode`, `token_budget`, embeddings) at 1000-contract scale.
 
-## 9. Order of operations
+## 9. Serving & consumption tier — DAB on ACA + Foundry agent
+
+The gold T-SQL tables are consumed by a **Microsoft Foundry prompt agent**
+(`ictr-agent`) through **two tools** — one structured, one semantic:
+
+| Tool | Backed by | Answers | Per-env binding |
+|---|---|---|---|
+| **DAB MCP** | Data API Builder on **Azure Container Apps**, read-only over the gold SQL endpoint | structured / aggregate questions over gold fields ("value of field X across contracts", filters, counts) | `DAB_FABRIC_CONN` → that stage's gold endpoint |
+| **Azure AI Search** | the `ictr_<env>_di_vision` index (built by nb_03) | semantic / RAG questions over contract chunks ("find the clause that says…") | `index_name` (already an env-varying value) |
+
+So the agent blends **structured** (DAB → gold fields) and **unstructured**
+(Search → chunks) retrieval. In each environment both tools point at *that*
+stage's resources — the same `index_name` the notebooks use, and the matching DAB
+ACA endpoint.
+
+### 9.1 DAB lives on its own track (not the Fabric deployment pipeline)
+
+`dab/` is a monorepo folder (Dockerfile + `dab-config.json` + ACA bicep/azd) with
+its **own** lifecycle: build image → push to ACR → deploy ACA. It is **not** a
+Fabric item and does **not** ride the Fabric deployment pipeline. `dab-config.json`
+(entities + read-only permissions) is baked into the image and identical across
+stages; only the injected connection string changes.
+
+```
+  Fabric gold SQL endpoint (dev / demo / prod)
+            ▲  Entra auth (ACA Managed Identity)
+            │  @env(DAB_FABRIC_CONN)
+  ┌─────────┴────────────────────────────┐
+  │ Azure Container Apps: DAB (read-only) │ ── MCP ──┐
+  │  dab-config.json baked in image       │          │
+  └───────────────────────────────────────┘          ▼
+   Azure AI Search index ───────▶ ┌───────────────────────────────────┐
+   (ictr_<env>_di_vision)         │ Microsoft Foundry: ictr-agent     │
+                                  │  tools: [ DAB MCP, AI Search ]    │
+                                  └───────────────────────────────────┘
+```
+
+### 9.2 Auth & security (the parts that bite)
+
+- **DAB → Fabric SQL is Entra-only — no SQL password.** Use the **ACA managed
+  identity**: `Authentication=Active Directory Managed Identity` in
+  `DAB_FABRIC_CONN`. Then grant that identity access **in Fabric** (workspace /
+  item access) **and** `GRANT SELECT` on the gold tables. This two-part grant is
+  the usual stall point. Bonus: no secret in the connection string at all.
+- **Lock down the MCP ingress.** The ACA HTTPS ingress serves gold contract data
+  — require Entra auth so only `ictr-agent` can call it. Never ship an open,
+  unauthenticated MCP endpoint.
+- **Pin the DAB image** (not `:latest`) for demo/prod reproducibility; confirm the
+  pinned version's MCP endpoint is supported.
+- **Agent → Search** uses the search endpoint/key from **Key Vault** — the *same*
+  secret the notebooks read; reuse it, don't duplicate.
+
+### 9.3 Per-environment binding (3 lifecycles, joined by config)
+
+Each environment has three independently-deployed pieces that bind by config, not
+by a shared pipeline:
+
+| Piece | dev | demo | prod | Promoted by |
+|---|---|---|---|---|
+| Fabric data tier (nb, gold) | dev ws | demo ws | prod ws | Fabric deployment pipeline |
+| DAB on ACA | dev ACA | demo ACA | prod ACA | container build + ACA deploy |
+| Foundry `ictr-agent` | dev agent | demo agent | prod agent | Foundry (azd / agent.yaml) |
+
+The agent's two tool bindings (`DAB endpoint`, `index_name`) are the only knobs
+that change per stage — keep them in the agent's own per-env config, mirroring the
+Variable Library on the Fabric side.
+
+## 10. Order of operations
 
 ```
 0. (prereq) Plan 04 merged & stable in dev
-1. Restructure package repo + build first wheel; validate in dev (wheel alongside mount)
+1. Restructure monorepo (core/ fabric/ dab/); build first wheel; validate in dev
 2. Swap secrets → Key Vault (getSecret); test in dev
 3. Create Variable Library; move env-specific keys; dev value set works
 4. Create demo + prod workspaces + lakehouses (empty)
 5. Create deployment pipeline dev→demo→prod; bind branches + value sets + rules
 6. Promote → demo (25 contracts), validate; then → prod (1000), validate
+7. Deploy DAB to ACA per env (MI auth + Fabric grants); wire DAB_FABRIC_CONN to gold
+8. Point ictr-agent's tools at each env's DAB MCP + AI Search index; validate Q&A
 ```
 
-Each step is independently reversible and leaves dev working.
+Each step is independently reversible and leaves dev working. Steps 7–8 (serving
+tier) proceed once a stage's gold is populated — dev first, then demo/prod.
 
-## 10. Risks & gotchas
+## 11. Risks & gotchas
 
 - **Lakehouse data is never promoted.** Tables/Files don't travel — each env
   ingests its own SharePoint folder. Plan for a first full bronze→gold run per
@@ -264,11 +343,18 @@ Each step is independently reversible and leaves dev working.
 - **Prod cost at 1000 contracts.** `vision.mode=correct` + embeddings + judging
   scale linearly — prod likely runs `verify`, not `correct`. Validate budget in
   demo first.
-- **Two repos, don't cross them.** Fabric-items repo (Git-connected to
-  workspaces) and the package repo are separate; the wheel ships via the
-  Environment, not via Git item sync.
+- **Monorepo, three sync paths.** One `ictr` repo, but `fabric/` is Git-synced to
+  the dev workspace, `core/` builds the wheel, and `dab/` builds a container —
+  Fabric Git carries *neither* the wheel nor the image.
+- **DAB managed-identity grants.** The ACA identity needs *both* Fabric workspace
+  access *and* `GRANT SELECT` on gold, or the MCP tool returns empty/forbidden.
+- **Secure the MCP ingress.** An open ACA endpoint exposes gold contract data;
+  require Entra auth so only `ictr-agent` can query it.
+- **Three lifecycles, joined by config.** Fabric (deployment pipeline), DAB (ACA
+  deploy), and the Foundry agent (azd) promote separately — keep their per-env
+  bindings (`index_name`, `DAB_FABRIC_CONN`, agent tool config) in sync.
 
-## 11. Out of scope / deferred
+## 12. Out of scope / deferred
 
 - **ADO CI to auto-build the wheel** on push (nice later; manual `python -m build`
   is fine for solo now).
@@ -277,7 +363,7 @@ Each step is independently reversible and leaves dev working.
 - **Private endpoints / managed VNet** for Key Vault.
 - **Automated tests gating promotion.** Your `eval/` could feed this later.
 
-## 12. Done criteria
+## 13. Done criteria
 
 - demo & prod notebooks `import contract_intelligence` from the **published wheel**
   (no mounted `src/`).
@@ -287,3 +373,7 @@ Each step is independently reversible and leaves dev working.
   edits).
 - The **deployment pipeline** promotes dev → demo → prod with green end-to-end
   runs at 25 and 1000 contracts.
+- **DAB** runs on ACA per env with managed-identity auth, MCP ingress locked to
+  the agent, bound to that stage's gold via `DAB_FABRIC_CONN`.
+- **`ictr-agent`** answers using both tools — DAB MCP (structured gold) and the
+  `ictr_<env>_di_vision` Search index (semantic) — against the matching env.
