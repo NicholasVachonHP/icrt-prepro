@@ -213,7 +213,39 @@ audit table is trusted. Defer.
 - Confirm a reprocess writes new rows under the new `version_id` and leaves prior
   rows intact (until retention prunes them).
 
-## 12. Roadmap (renumbered from PLAN_03 §12)
+## 12. Pipeline orchestration (`ictr_pl`)
+
+The daily pipeline `ictr_pl` (id `c97ff2c1-b640-4143-8c96-23f1a01e94cb`)
+currently fans **nb_03** (chunk/embed/index) and **nb_04** (gold fields) out in
+**parallel** after silver. That was safe before, but gold now *reads* the AI
+Search index — RAG / retrieve-classify groups, Plan 03 vision retrieval-first
+page selection, and the Plan 04 re-judge — so a parallel run lets gold query a
+half-rebuilt index.
+
+**Change (orchestration only, no code):** serialize
+`bronze → silver → nb_03 → nb_04`, i.e. make nb_04 depend **On success** of
+nb_03. Keep `RECREATE_INDEX = False`: the index build is incremental and
+self-healing — it upserts live chunks and deletes superseded ones (a replaced
+company contract flips `is_current = false` and its chunks are pruned), so gold
+always reads a current index
+([serving/search_index.py](../../src/contract_intelligence/serving/search_index.py)).
+Cost is a slightly longer nightly window (sum, not max, of the two notebooks),
+accepted at this scale.
+
+**Tooling reality — applied manually.** The agent's Fabric tools expose only
+*list / get / create / run* for pipelines (no edit-definition API), and OneLake
+writes are unauthorized here (403). So the agent **cannot push this edit** — it
+is a one-time change in the Fabric pipeline UI: set nb_04's activity dependency
+to *On success* of nb_03 and remove the parallel edge. The agent will read the
+current definition (`get-pipeline`) to give the exact activity names and confirm
+no other activity depends on the old parallel layout before you make the change.
+
+**Out of scope:** nb_04 stays a **single** notebook (extract → judge → verify →
+correct → re-judge → audit in one transaction). Splitting "find answers" from
+"verify/correct" is revisited only if vision ever needs a separate cadence/budget
+from extraction — not required here.
+
+## 13. Roadmap (renumbered from PLAN_03 §12)
 
 - **PLAN_05 — Feedback & calibration loop.** Capture human review decisions
   (accept / override / correct) in `contract_field_review`; join with the audit
