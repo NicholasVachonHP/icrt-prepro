@@ -353,6 +353,22 @@ tier) proceed once a stage's gold is populated — dev first, then demo/prod.
 - **Three lifecycles, joined by config.** Fabric (deployment pipeline), DAB (ACA
   deploy), and the Foundry agent (azd) promote separately — keep their per-env
   bindings (`index_name`, `DAB_FABRIC_CONN`, agent tool config) in sync.
+- **Config changes must validate in dev before prod promotion.** The shared
+  `evidence.py` applies to both environments immediately, but config-driven
+  changes (e.g., `fuzzy_threshold` 0.85→0.80, `vision.correct_max_fields` 4→8)
+  should hold in `prod.json` until dev validation confirms precision is held (via
+  nb05 eval). The trust-promotion code change (correct + confirmed → high) already
+  benefits prod via the shared codebase, but deliberate config tuning belongs in
+  the dev→demo→prod gate.
+- **Audit trail length requires lifecycle management.** The `contract_field_audit`
+  table is **append-only, forward-only** with no built-in retention or pruning.
+  Each contract reprocess appends a new step log (in gated mode: full causal trail
+  for "interesting" fields + terminal row for clean fields). Over time and at
+  1000-contract scale, the audit table will grow unbounded. Plan a **retention
+  policy** (e.g., keep only the last N versions per contract, or partition by date
+  and archive old audit rows to cold storage) before prod launch, or monitor
+  storage cost and trigger manual purges. The table schema carries no SCD2 / time
+  bounds by design (operational simplicity), so cleanup is external.
 
 ## 12. Out of scope / deferred
 

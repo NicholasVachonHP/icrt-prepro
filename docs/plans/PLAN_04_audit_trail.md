@@ -213,7 +213,7 @@ audit table is trusted. Defer.
 - Confirm a reprocess writes new rows under the new `version_id` and leaves prior
   rows intact (until retention prunes them).
 
-## 12. Pipeline orchestration (`ictr_pl`)
+## 12. Pipeline orchestration (`ictr_pl`) — ✅ Applied (2026-06-30)
 
 The daily pipeline `ictr_pl` (id `c97ff2c1-b640-4143-8c96-23f1a01e94cb`)
 currently fans **nb_03** (chunk/embed/index) and **nb_04** (gold fields) out in
@@ -234,11 +234,11 @@ accepted at this scale.
 
 **Tooling reality — applied manually.** The agent's Fabric tools expose only
 *list / get / create / run* for pipelines (no edit-definition API), and OneLake
-writes are unauthorized here (403). So the agent **cannot push this edit** — it
-is a one-time change in the Fabric pipeline UI: set nb_04's activity dependency
-to *On success* of nb_03 and remove the parallel edge. The agent will read the
-current definition (`get-pipeline`) to give the exact activity names and confirm
-no other activity depends on the old parallel layout before you make the change.
+writes are unauthorized here (403), so the agent could not push this edit. It was
+made by hand on **2026-06-30**: `nb04_gold_fields`'s `dependsOn` was repointed
+from `nb02_silver_extract` to `nb03_chunk_embed_index` (*On success*), giving the
+linear chain `nb01 → nb02 → nb03 → nb04`. No other activity depended on the old
+parallel layout.
 
 **Out of scope:** nb_04 stays a **single** notebook (extract → judge → verify →
 correct → re-judge → audit in one transaction). Splitting "find answers" from

@@ -59,7 +59,7 @@
     "fields_evidence_active_view": "contract_field_evidence_active",
     "judge_enabled": true,
     "judge_model": null,
-    "fuzzy_threshold": 0.85,
+    "fuzzy_threshold": 0.80,
     "evidence_max_chars": 600,
     "_structured_output_note": "Fields are grouped by extraction strategy (one focused model call per group). Each call uses a strict per-type json_schema response_format so values come back correctly typed (boolean/integer/array/struct). Falls back to a plain json_object call if the deployment rejects json_schema. Feeds the gold code_hash, so toggling it re-extracts all contracts.",
     "structured_output": true,
@@ -75,7 +75,7 @@
       "mode": "correct",
       "model": null,
       "max_chars": 4000,
-      "correct_max_fields": 4,
+      "correct_max_fields": 8,
       "page_scan_limit": 3
     },
     "_token_budget_note": "Caps the summed in-flight token cost across the global gold work queue (gold/scheduler.py), which fans every model call from every contract (extraction -> reduce -> judge) into one pool throttled by tokens, not a fixed thread count. Set below the gpt-4.1 deployment's per-minute token ceiling (750K TPM); 500K leaves headroom for SDK 429 retries. Pure runtime knob \u2014 NOT part of the code fingerprint, so tuning it never forces reprocessing. Replaces the now-ignored max_concurrency.",

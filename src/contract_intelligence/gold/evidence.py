@@ -235,7 +235,10 @@ def derive_trust(
     * verdict ``unverifiable`` -> ``unknown``.
     * verdict ``correct`` + quote located -> ``high``.
     * verdict ``correct`` + quote NOT located -> ``review`` (value may be right
-      but the cited quote is paraphrased/unlocatable -- do not silently trust).
+      but the cited quote is paraphrased/unlocatable -- do not silently trust),
+      UNLESS ``source_verified == 'confirmed'`` (a vision pass read the source
+      page and agreed) -> ``high``: the image, not the paraphrased quote, anchors
+      the value (mirrors the ``vision_page`` guardrail for corrections).
 
     ``validation`` is an independent structural gate (see
     :func:`contract_intelligence.gold.validate.validate_value`). A value that is
@@ -246,13 +249,26 @@ def derive_trust(
     ``source_verified`` is the Source->DI confidence gate (Plan 02). When the
     source layer is ``low`` (DI read the evidence span poorly, or the whole
     document scored ``di_quality_flag == 'low'``) a ``high`` is demoted to
-    ``review`` -- the model may be faithful to garbled text. ``high`` /
-    ``confirmed`` / ``None`` leave the verdict untouched, so a vision pass that
-    *confirms* the page lets a genuine ``high`` stand.
+    ``review`` -- the model may be faithful to garbled text. ``confirmed`` (a
+    vision pass agreed with the page) lets a genuine ``high`` stand AND can
+    *promote* a ``correct`` value that was review-trapped only because its quote
+    was unlocatable; ``high`` / ``None`` leave the verdict untouched.
     """
     if value is None:
         return TRUST_UNKNOWN
     trust = _judge_trust(match_type, judge_verdict, judge_error, judge_enabled)
+    # Vision-confirmed correct value with an unlocatable text quote: the source
+    # page itself backs the value (source_verified='confirmed' from a vision
+    # verify pass) and the judge agrees it answers the question, so a paraphrased
+    # quote that doesn't match the silver text should not strand it at 'review'.
+    # Promote to 'high' -- mirrors the MATCH_VISION_PAGE guardrail that already
+    # lets an image-backed *correction* count as located.
+    if (
+        trust == TRUST_REVIEW
+        and judge_verdict == VERDICT_CORRECT
+        and source_verified == SOURCE_CONFIRMED
+    ):
+        trust = TRUST_HIGH
     if validation == vld.INVALID and trust == TRUST_HIGH:
         trust = TRUST_REVIEW
     if source_verified == SOURCE_LOW and trust == TRUST_HIGH:
