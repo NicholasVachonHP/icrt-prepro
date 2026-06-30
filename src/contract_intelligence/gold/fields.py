@@ -131,6 +131,51 @@ _EVIDENCE_META = [
 
 _EVIDENCE_SCHEMA = StructType(_EVIDENCE_META)
 
+
+# ---------------------------------------------------------------------------
+# Append-only field-level audit trail (Plan 04)
+# ---------------------------------------------------------------------------
+# Every field walks an ordered, causal sequence of stages; ``contract_field_audit``
+# records one row per stage it passed through, in ``step_seq`` order. The table is
+# strictly append-only -- no SCD2, no ``is_current``, no in-place updates -- and is
+# NOT part of the gold code fingerprint, so enabling it never forces reprocessing.
+# The last row (max ``step_seq``) for a (version_id, field_name) reproduces the live
+# ``contract_field_evidence`` row exactly: both are projected from the same
+# in-memory field-row at end of processing.
+AUDIT_EXTRACT = "extract"            # value first produced (verdict null)
+AUDIT_JUDGE = "judge"                # initial faithfulness/relevance judge
+AUDIT_VISION_VERIFY = "vision_verify"   # source page confirmed/contradicted value
+AUDIT_VISION_CORRECT = "vision_correct" # value re-read straight off the page image
+AUDIT_REJUDGE = "rejudge"            # re-judge of a vision-corrected value
+
+# gold.audit.mode enum.
+AUDIT_MODE_OFF = "off"      # write nothing
+AUDIT_MODE_GATED = "gated"  # full step log for 'interesting' fields, else 1 terminal row
+AUDIT_MODE_FULL = "full"    # every step for every field
+_AUDIT_MODES = (AUDIT_MODE_OFF, AUDIT_MODE_GATED, AUDIT_MODE_FULL)
+
+_AUDIT_META = [
+    StructField("audit_id", StringType(), False),        # sha(version_id|field|stage|seq)
+    StructField("version_id", StringType(), False),      # = wide/evidence row's version_id
+    StructField("relative_path", StringType(), False),
+    StructField("file_name", StringType(), False),
+    StructField("field_name", StringType(), False),
+    StructField("step_seq", IntegerType(), False),       # 1,2,3... causal order
+    StructField("stage", StringType(), False),           # extract/judge/vision_*/rejudge
+    StructField("verdict", StringType(), True),          # stage-specific verdict
+    StructField("rationale", StringType(), True),        # stage-specific one-liner
+    StructField("value_after", StringType(), True),      # field state AFTER this stage
+    StructField("evidence_text_after", StringType(), True),
+    StructField("match_type_after", StringType(), True),
+    StructField("source_verified_after", StringType(), True),
+    StructField("trust_after", StringType(), True),
+    StructField("page_after", IntegerType(), True),
+    StructField("model", StringType(), True),            # model that produced the stage
+    StructField("created_at", TimestampType(), False),
+]
+
+_AUDIT_SCHEMA = StructType(_AUDIT_META)
+
 _SYSTEM_PROMPT = (
     "You are a meticulous contracts analyst. You extract structured facts from a "
     "single contract. Only use information present in the contract text. If a value "
@@ -309,6 +354,47 @@ def _stringify_value(v):
 def _evidence_id(version_id, field_name):
     """Stable unique key for a (contract version, field) evidence row."""
     return hashlib.sha256(f"{version_id}|{field_name}".encode()).hexdigest()[:16]
+
+
+def _audit_id(version_id, field_name, stage, step_seq):
+    """Stable unique key for one audit step of a (contract version, field)."""
+    return hashlib.sha256(
+        f"{version_id}|{field_name}|{stage}|{step_seq}".encode()
+    ).hexdigest()[:16]
+
+
+def _audit_step(stage, verdict, rationale, *, value, evidence_text, match_type,
+                source_verified, trust, page, model=None):
+    """Build one audit-step snapshot dict (the field's state AFTER ``stage``)."""
+    return {
+        "stage": stage,
+        "verdict": verdict,
+        "rationale": rationale,
+        "value_after": value,
+        "evidence_text_after": evidence_text,
+        "match_type_after": match_type,
+        "source_verified_after": source_verified,
+        "trust_after": trust,
+        "page_after": page,
+        "model": model,
+    }
+
+
+def _append_audit(fr, stage, verdict, rationale, model=None):
+    """Snapshot a field-row's current state as an audit step and append it.
+
+    Used by the vision stage, which mutates ``fr`` in place: each call records the
+    state *after* the mutation so the log stays causal. The ``extract``/``judge``
+    steps are built directly in :func:`_finalize_contract` (the field-row dict does
+    not exist yet at that point)."""
+    fr.setdefault("_audit_steps", []).append(
+        _audit_step(
+            stage, verdict, rationale,
+            value=fr["value"], evidence_text=fr["evidence_text"],
+            match_type=fr["match_type"], source_verified=fr["source_verified"],
+            trust=fr["trust"], page=fr["evidence_page"], model=model,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +722,28 @@ def _finalize_contract(
         if quote and evidence_max_chars and len(quote) > evidence_max_chars:
             quote = quote[:evidence_max_chars]
         cids = chunk_ids_by_field.get(name)
+        # Audit trail (Plan 04): the extract step (located, pre-judge) then the
+        # judge step (post-judge). Both share the same located state; only the
+        # verdict and the trust it derives differ. The vision stage appends later
+        # steps in place. extract's trust is the honest pre-judge (locate-only)
+        # value so the log reads causally.
+        extract_trust = ev.derive_trust(
+            value_str, match_type, None, None, False, validation, source_verified,
+        )
+        audit_steps = [
+            _audit_step(
+                AUDIT_EXTRACT, None,
+                f"extracted via {strategies.get(name) or 'default'}",
+                value=value_str, evidence_text=quote, match_type=match_type,
+                source_verified=source_verified, trust=extract_trust,
+                page=evidence_page,
+            ),
+            _audit_step(
+                AUDIT_JUDGE, verdict, rationale,
+                value=value_str, evidence_text=quote, match_type=match_type,
+                source_verified=source_verified, trust=trust, page=evidence_page,
+            ),
+        ]
         field_rows.append(
             {
                 "field_name": name,
@@ -658,6 +766,7 @@ def _finalize_contract(
                 "original_value": None,
                 "trust": trust,
                 "contract_truncated": truncated,
+                "_audit_steps": audit_steps,
             }
         )
     return values, None, truncated, field_rows
@@ -1179,6 +1288,9 @@ def _run_vision_stage(
                     fr["source_verified"],
                 )
                 verified_n += 1
+                _append_audit(
+                    fr, AUDIT_VISION_VERIFY, verdict, rationale, vision_model
+                )
 
             # ---- correct (Plan 03; only when verify can't confirm) ----
             if mode == vision.MODE_CORRECT and verdict != vision.VERDICT_CONFIRMED:
@@ -1208,6 +1320,16 @@ def _run_vision_stage(
                     fr["evidence_text"] = new_quote
                     fr["source_verified"] = ev.SOURCE_CONFIRMED
                     corrected.append(fr)
+                # Log a vision_correct step whenever correct_field returned a
+                # verdict: an OK correction snapshots the replaced value (re-judge
+                # finalises its trust below); an 'unclear' correction snapshots the
+                # unchanged state so the log still shows vision was attempted.
+                if corr and corr.get("verdict"):
+                    _append_audit(
+                        fr, AUDIT_VISION_CORRECT, corr["verdict"],
+                        corr.get("rationale") or fr.get("vision_rationale"),
+                        vision_model,
+                    )
 
         # ---- re-judge corrected fields (one batched call) + re-derive trust ----
         if corrected:
@@ -1244,6 +1366,10 @@ def _run_vision_stage(
                     fr["source_verified"],
                 )
                 corrected_n += 1
+                _append_audit(
+                    fr, AUDIT_REJUDGE, fr["judge_verdict"], fr["judge_rationale"],
+                    judge_model,
+                )
 
     if verified_n or corrected_n:
         print(
@@ -1287,6 +1413,20 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
     evidence_view = gold_cfg.get(
         "fields_evidence_active_view", "contract_field_evidence_active"
     )
+    # Append-only field-level audit trail (Plan 04). mode off/gated/full; a pure
+    # runtime knob, deliberately NOT part of the code fingerprint below, so
+    # toggling it never forces reprocessing. The log is forward-only: enabling it
+    # does not reprocess anything on its own, so a contract only gets audit rows
+    # the next time it is (re)extracted -- force-reprocess once (force_paths=ALL)
+    # to backfill the trail for the existing set.
+    audit_table = gold_cfg.get("fields_audit_table", "contract_field_audit")
+    audit_view = gold_cfg.get(
+        "fields_audit_active_view", "contract_field_audit_current"
+    )
+    audit_cfg = gold_cfg.get("audit", {}) or {}
+    audit_mode = (audit_cfg.get("mode") or AUDIT_MODE_OFF).strip().lower()
+    if audit_mode not in _AUDIT_MODES:
+        audit_mode = AUDIT_MODE_OFF
     silver_text_table = gold_cfg.get("silver_text_table", "dbo/contract_text")
     max_chars = int(gold_cfg.get("max_input_chars", _DEFAULT_MAX_INPUT_CHARS))
     # Evidence + trust knobs. judge_enabled=False degrades cleanly to extract +
@@ -1469,6 +1609,7 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
         rows = []
         evidence_rows = []
         evidence_keys = []  # relative_paths that got evidence (no extract error)
+        audit_rows = []     # append-only audit-trail rows (Plan 04)
         errors = 0
 
         # Build retrieval inputs once on the driver. Map-reduce list fields
@@ -1603,6 +1744,52 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
                     )
                 )
 
+                # ---- append-only audit trail (Plan 04) ----
+                # A field is 'interesting' when something notable happened to it:
+                # vision touched it, the judge wasn't outright 'correct', or its
+                # final trust isn't 'high'. gated mode logs the full causal step
+                # sequence for interesting fields and a single terminal row for
+                # clean ones; full logs every step; off logs nothing. The terminal
+                # row (max step_seq) reproduces the evidence row above exactly.
+                if audit_mode != AUDIT_MODE_OFF:
+                    steps = fr.get("_audit_steps") or []
+                    if steps:
+                        interesting = (
+                            fr["vision_action"] != "none"
+                            or fr["judge_verdict"] != ev.VERDICT_CORRECT
+                            or fr["trust"] != ev.TRUST_HIGH
+                        )
+                        chosen = (
+                            steps
+                            if (audit_mode == AUDIT_MODE_FULL or interesting)
+                            else steps[-1:]
+                        )
+                        for seq, st in enumerate(chosen, start=1):
+                            audit_rows.append(
+                                Row(
+                                    audit_id=_audit_id(
+                                        r["version_id"], fr["field_name"],
+                                        st["stage"], seq,
+                                    ),
+                                    version_id=r["version_id"],
+                                    relative_path=r["relative_path"],
+                                    file_name=r["file_name"],
+                                    field_name=fr["field_name"],
+                                    step_seq=seq,
+                                    stage=st["stage"],
+                                    verdict=st["verdict"],
+                                    rationale=st["rationale"],
+                                    value_after=st["value_after"],
+                                    evidence_text_after=st["evidence_text_after"],
+                                    match_type_after=st["match_type_after"],
+                                    source_verified_after=st["source_verified_after"],
+                                    trust_after=st["trust_after"],
+                                    page_after=st["page_after"],
+                                    model=st["model"] or model,
+                                    created_at=extracted_at,
+                                )
+                            )
+
         source_df = spark.createDataFrame(rows, schema=schema)
 
         # SCD2 upsert: a changed version expires the prior current row and
@@ -1637,6 +1824,18 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
             print(
                 f"Wrote {evidence_df.count()} evidence row(s) to '{evidence_table}' "
                 f"for {len(evidence_keys)} contract(s)."
+            )
+
+        # Append-only audit trail (Plan 04): a plain Delta append (no SCD2, no
+        # tombstoning) -- prior rows are immutable history. The table is created
+        # on first write; reprocessing a contract appends rows under a new
+        # version_id and leaves earlier versions untouched.
+        if audit_mode != AUDIT_MODE_OFF and audit_rows:
+            audit_df = spark.createDataFrame(audit_rows, schema=_AUDIT_SCHEMA)
+            audit_df.write.format("delta").mode("append").saveAsTable(audit_table)
+            print(
+                f"Appended {audit_df.count()} audit row(s) to '{audit_table}' "
+                f"(mode={audit_mode})."
             )
 
     # Tombstone the current gold version of contracts no longer active in silver.
@@ -1705,3 +1904,27 @@ def run(spark, notebookutils, config=None, silver_tables_path=None, force_paths=
         )
         active_ev = spark.table(evidence_view).count()
         print(f"View '{evidence_view}' up to date: {active_ev} active evidence row(s).")
+
+    # Final-projection view over the append-only audit log: the terminal row
+    # (max step_seq) per (version_id, field_name), scoped to the live gold
+    # versions via the active evidence view. Each row here reproduces its
+    # contract_field_evidence counterpart exactly, while the full log retains the
+    # causal step history. Guarded on both tables existing and audit enabled.
+    if (
+        audit_mode != AUDIT_MODE_OFF
+        and spark.catalog.tableExists(audit_table)
+        and spark.catalog.tableExists(evidence_table)
+    ):
+        spark.sql(
+            f"CREATE OR REPLACE VIEW {audit_view} AS "
+            f"SELECT a.* FROM {audit_table} a "
+            f"JOIN (SELECT version_id, field_name, MAX(step_seq) AS step_seq "
+            f"FROM {audit_table} GROUP BY version_id, field_name) m "
+            f"ON a.version_id = m.version_id AND a.field_name = m.field_name "
+            f"AND a.step_seq = m.step_seq "
+            f"WHERE a.version_id IN (SELECT DISTINCT version_id FROM {evidence_view})"
+        )
+        active_audit = spark.table(audit_view).count()
+        print(
+            f"View '{audit_view}' up to date: {active_audit} current audit row(s)."
+        )

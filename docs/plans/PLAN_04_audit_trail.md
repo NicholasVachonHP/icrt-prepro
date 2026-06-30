@@ -1,6 +1,6 @@
 # Plan 04 — Append-only audit trail for the trust pipeline
 
-**Status:** Proposed · **Date:** 2026-06-24 · **Scope:** gold provenance — new append-only `contract_field_audit` table + slim `contract_field_evidence` projection
+**Status:** Implemented · **Date:** 2026-06-24 · **Scope:** gold provenance — new append-only `contract_field_audit` table + slim `contract_field_evidence` projection
 
 ## 1. Goal
 

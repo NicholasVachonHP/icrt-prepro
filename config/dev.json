@@ -79,7 +79,11 @@
       "page_scan_limit": 3
     },
     "_token_budget_note": "Caps the summed in-flight token cost across the global gold work queue (gold/scheduler.py), which fans every model call from every contract (extraction -> reduce -> judge) into one pool throttled by tokens, not a fixed thread count. Set below the gpt-4.1 deployment's per-minute token ceiling (750K TPM); 500K leaves headroom for SDK 429 retries. Pure runtime knob \u2014 NOT part of the code fingerprint, so tuning it never forces reprocessing. Replaces the now-ignored max_concurrency.",
-    "token_budget": 500000
+    "token_budget": 500000,
+    "_audit_note": "Plan 04 append-only field-level audit trail (contract_field_audit). mode=off writes nothing; gated (recommended) writes the full causal step log (extract -> judge -> vision_verify -> vision_correct -> rejudge) for 'interesting' fields (vision touched them, the judge wasn't 'correct', or final trust != 'high') and a single terminal row for clean fields; full writes every step for every field. The terminal row (max step_seq) per field reproduces its contract_field_evidence row exactly. Pure runtime knob \u2014 NOT part of the gold code fingerprint, so toggling it never forces reprocessing. The log is forward-only: enabling it reprocesses nothing on its own, so a contract only gets audit rows the next time it is (re)extracted \u2014 run gold once with reprocess.force_paths=ALL to backfill the trail for the existing set, after which normal runs append rows whenever a contract reprocesses.",
+    "audit": {
+      "mode": "gated"
+    }
   },
   "eval": {
     "_note": "Standalone gold quality gate (contract_intelligence.eval.gold_eval). Scores contract_fields against a hand-authored ground truth derived from docs/Contract_Review.docx. Run on demand after prompt/field/model changes \u2014 not part of the daily pipeline. truth is keyed by join_key; results append to results_table in the gold lakehouse.",
